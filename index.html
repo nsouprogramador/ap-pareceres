@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -2840,12 +2841,15 @@ async function lerImagemBase64(f) {
 }
 
 // Converte primeira página de PDF em imagem base64 (para OCR e viewer)
-async function pdfParaImagemBase64(f) {
+async function pdfParaImagemBase64(f, numPagina) {
+  // numPagina opcional (default 1) — compatível com chamadas antigas
   try {
     if (typeof pdfjsLib === 'undefined') return null;
     const buf = await f.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-    const pg  = await pdf.getPage(1);
+    const p   = numPagina || 1;
+    if (p > pdf.numPages) return null;
+    const pg  = await pdf.getPage(p);
     const vp  = pg.getViewport({ scale: 2.0 });
     const canvas = document.createElement('canvas');
     canvas.width  = vp.width;
@@ -2855,6 +2859,29 @@ async function pdfParaImagemBase64(f) {
   } catch(e) {
     log('PDF→IMG FALHOU', e.message);
     return null;
+  }
+}
+
+// Converte TODAS as páginas em array de imagens base64
+async function pdfParaImagensTodasPaginas(f) {
+  try {
+    if (typeof pdfjsLib === 'undefined') return [];
+    const buf = await f.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    const imagens = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const pg = await pdf.getPage(p);
+      const vp = pg.getViewport({ scale: 2.0 });
+      const canvas = document.createElement('canvas');
+      canvas.width  = vp.width;
+      canvas.height = vp.height;
+      await pg.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+      imagens.push(canvas.toDataURL('image/jpeg', 0.92));
+    }
+    return imagens;
+  } catch(e) {
+    log('PDF→IMGS FALHOU', e.message);
+    return [];
   }
 }
 
@@ -4945,14 +4972,14 @@ function extrairCNIS(t) {
     tipoDocumento: 'CNIS - Extrato Previdenciario',
     pesoDocumento: 'ALTO',
     _vinculos: [],
-    _contribuicoes: [],           // lista simples de MM/AAAA (retrocompat)
-    _contribuicoesDetalhadas: [], // lista com { comp, valor, indicadores }
+    _contribuicoes: [],
+    _contribuicoesDetalhadas: [],
     _totalContribuicoes: 0,
     _totalContribuicoesValidas: 0,
   };
   var T = t.split('\r').join('');
 
-  // ── Identificação ─────────────────────────────────────────────────
+  // ── Identificação ──
   var nitM  = T.match(/NIT[:\s]+([\d\.\-]+)/i);
   if (nitM)  d._nit = nitM[1].trim();
   var cpfM  = _cpf(T); if (cpfM) d.cpfCnpj = cpfM;
@@ -4963,47 +4990,116 @@ function extrairCNIS(t) {
   var maeM  = T.match(/Nome da m[a\xe3][e\xea][:\s]+([A-Z\xC1\xC9\xCD\xD3\xDA][^\n]{3,60})/i);
   if (maeM)  d._nomeMae = maeM[1].trim().split('\n')[0].trim();
 
-  // ── Vínculos — parse linha a linha ────────────────────────────────
-  var linhas = T.split('\n');
+  // ── VÍNCULOS — busca robusta (funciona com PDF.js quebrado em linhas) ──
+  // Estratégia: para cada "Seq. X" seguido de empregador + datas,
+  // coleta todos os dados em até ~25 linhas até o próximo seq ou seção
+  var linhas = T.split('\n').map(function(l) { return l.trim(); });
+  var ultimoSeq = 0;
   for (var li = 0; li < linhas.length; li++) {
-    var linha = linhas[li].trim();
-    var seqM  = linha.match(/^(\d{1,3})\s+([\d\.\-]{6,})\s+(.{3,}?)\s+(Empregad|Contribuin)/i);
-    if (!seqM) continue;
-    var blocoVin = linhas.slice(li, Math.min(li+5, linhas.length)).join(' ');
-    var datasM   = blocoVin.match(/(\d{2}\/\d{2}\/\d{4})\s+(\d{2}\/\d{2}\/\d{4})/);
-    if (!datasM) continue;
-    var emp = seqM[3].trim()
-      .replace(/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\s*/g,'')
-      .replace(/\d{3}\.\d{5}\.\d{2}-\d\s*/g,'').trim();
-    if (emp.length < 3) continue;
-    var tipo = seqM[4].toLowerCase().startsWith('empregad')
-      ? 'Empregado/Agente Publico' : 'Contribuinte Individual';
-
-    // Conta competências no bloco deste vínculo
-    var nextIdx = li + 1;
-    while (nextIdx < linhas.length) {
-      var nl = linhas[nextIdx].trim();
-      if (/^\d{1,3}\s+[\d\.]{6,}/.test(nl) || /^Relações|^Valores Consol/i.test(nl)) break;
-      nextIdx++;
+    var linha = linhas[li];
+    // Busca linha que é APENAS um número de seq (1-99)
+    var seqM = linha.match(/^(\d{1,2})$/);
+    // Ou linha no formato antigo "1 XX.XX.XX EMPRESA Empregad"
+    var seqMAntigo = linha.match(/^(\d{1,2})\s+[\d\.\-]{6,}\s+(.{3,}?)\s+(Empregad|Contribuin)/i);
+    
+    var seq = null, empresaEncontrada = null, tipoVinculo = null;
+    var lookAheadFim = Math.min(li + 25, linhas.length);
+    
+    if (seqMAntigo) {
+      seq = parseInt(seqMAntigo[1]);
+      empresaEncontrada = seqMAntigo[2].trim();
+      tipoVinculo = seqMAntigo[3].toLowerCase().startsWith('empregad')
+        ? 'Empregado/Agente Publico' : 'Contribuinte Individual';
+    } else if (seqM) {
+      seq = parseInt(seqM[1]);
+      // Verifica se faz sentido como próximo seq (monotônico crescente)
+      if (seq !== ultimoSeq + 1) continue;
+      // Procura linhas seguintes para validar: deve ter NIT-like + empregador + Empregado/Contribuinte
+      var bloco = linhas.slice(li, lookAheadFim).join(' ');
+      if (!/Empregad|Contribuin|Benef[ií]cio/i.test(bloco)) continue;
+      if (!/\d{2}\.\d{3}\.\d{3}|\d{3}\.\d{5}\.\d{2}|\bNB\b|\d{2}\/\d{2}\/\d{4}/.test(bloco)) continue;
+      // Nome da empresa/origem: primeira linha longa após o seq que não é um padrão conhecido
+      for (var fi = li + 1; fi < lookAheadFim; fi++) {
+        var lf = linhas[fi];
+        if (!lf) continue;
+        // Pula linhas claramente não-empresa
+        if (/^(Código|Origem|Tipo|Seq|NIT|Matr|Data|Emp|Empregad|Contribuin|Benef|Público|Remuner|Compet|Indicad|P[úu]blico|\d{2}\/\d{2}\/\d{4}|[\d\.\-]+$)/i.test(lf)) continue;
+        if (lf.length < 3) continue;
+        // Aceita como empresa
+        empresaEncontrada = lf;
+        // Pode ter linha seguinte que é continuação do nome
+        var prox = linhas[fi+1];
+        if (prox && /^[A-Z]/.test(prox) && prox.length < 60 && !/Empregad|Contribuin|P[úu]blico|\d{2}\//i.test(prox)) {
+          empresaEncontrada += ' ' + prox;
+        }
+        break;
+      }
+      // Tipo do vínculo
+      if (/Empregad/i.test(bloco)) tipoVinculo = 'Empregado/Agente Publico';
+      else if (/Contribuin/i.test(bloco)) tipoVinculo = 'Contribuinte Individual';
+      else if (/Benef/i.test(bloco)) tipoVinculo = 'Beneficio';
+      else continue;
+    } else {
+      continue;
     }
-    var blocoC = linhas.slice(li+1, nextIdx).join(' ');
-    var compsV = (blocoC.match(/\d{2}\/\d{4}/g)||[]).filter(function(c){
-      return parseInt(c.split('/')[0])>=1 && parseInt(c.split('/')[0])<=12
-          && parseInt(c.split('/')[1])>=1990;
-    }).length;
+    if (!seq || !empresaEncontrada || !tipoVinculo) continue;
 
-    d._vinculos.push({ seq:seqM[1], empresa:emp.substring(0,55), tipo:tipo,
-                       inicio:datasM[1], fim:datasM[2], contribuicoes:compsV });
+    // Busca datas (até 2 no formato DD/MM/AAAA e possivelmente MM/AAAA)
+    var bloco = linhas.slice(li, lookAheadFim).join(' ');
+    var datasCompletas = bloco.match(/\d{2}\/\d{2}\/\d{4}/g) || [];
+    var competencias   = bloco.match(/(?<!\d\/)\d{2}\/\d{4}(?!\d)/g) || [];
+    
+    var dataIni = datasCompletas[0] || null;
+    var dataFim = null;
+    
+    if (datasCompletas.length >= 2) {
+      dataFim = datasCompletas[1];
+    } else if (datasCompletas.length === 1 && competencias.length > 0) {
+      // Heurística: se a competência está próxima do início, é fim
+      // Se está muito distante (> 3 anos), é "Últ. Remun." de vínculo ATIVO
+      var cmp = competencias[0];
+      var anoIni = parseInt(dataIni.split('/')[2]);
+      var mesIni = parseInt(dataIni.split('/')[1]);
+      var anoCmp = parseInt(cmp.split('/')[1]);
+      var mesCmp = parseInt(cmp.split('/')[0]);
+      var difMeses = (anoCmp - anoIni) * 12 + (mesCmp - mesIni);
+      if (difMeses >= 0 && difMeses <= 36) {
+        // Fim curto: converte competência em último dia do mês
+        var ultDia = new Date(anoCmp, mesCmp, 0).getDate();
+        dataFim = String(ultDia).padStart(2,'0') + '/' + String(mesCmp).padStart(2,'0') + '/' + anoCmp;
+      }
+      // Se difMeses > 36: vínculo em aberto (dataFim continua null)
+    }
+    // Se só tem 1 data e nenhuma competência: vínculo em aberto (dataFim = null)
+    
+    if (!dataIni) continue;
+    
+    // Limpa nome da empresa de CNPJs que possam ter vindo junto
+    var emp = empresaEncontrada
+      .replace(/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\s*/g, '')
+      .replace(/\d{3}\.\d{5}\.\d{2}-\d\s*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (emp.length < 3) continue;
+
+    d._vinculos.push({
+      seq: String(seq),
+      empresa: emp.substring(0, 55),
+      tipo: tipoVinculo,
+      inicio: dataIni,
+      fim: dataFim, // null = vínculo em aberto
+      contribuicoes: 0, // será preenchido depois
+    });
+    ultimoSeq = seq;
   }
-  // Deduplica
-  d._vinculos = d._vinculos.filter(function(v,idx2,arr){
-    return arr.findIndex(function(x){ return x.seq===v.seq; }) === idx2;
+
+  // Deduplica por seq
+  d._vinculos = d._vinculos.filter(function(v, idx2, arr) {
+    return arr.findIndex(function(x) { return x.seq === v.seq; }) === idx2;
   });
 
-  // ── Competências com valor e indicadores ─────────────────────────
-  // Padrão: "MM/AAAA VALOR [INDICADORES]"
-  // Ex: "03/2021 159,04 PSC-MEN-SM-EC103"
-  // Ex: "06/2017 1.051,00"
+  // ── COMPETÊNCIAS — busca robusta ──
+  // O regex atual funciona, mantém
   var compRe = /(\d{2}\/\d{4})\s+([\d\.,]+)(?:\s+([A-Z][^\n\d]{2,80}?))?(?=\s+\d{2}\/|\s*$|\s+\d{2}\/\d{4})/g;
   var mc;
   while ((mc = compRe.exec(T)) !== null) {
@@ -5013,66 +5109,97 @@ function extrairCNIS(t) {
     var valStr = mc[2].replace(/\./g,'').replace(',','.');
     var val    = parseFloat(valStr) || 0;
     var inds   = (mc[3] || '').trim().replace(/\s+/g,' ');
-    // Limpa indicadores: remove o que parece ser próxima competência
     if (/^\d{2}\/\d{4}/.test(inds)) inds = '';
     d._contribuicoesDetalhadas.push({ comp: mc[1], valor: val, indicadores: inds });
     d._contribuicoes.push(mc[1]);
   }
 
-  // Remove duplicatas por competência (mantém a mais recente)
+  // Dedup por competência (mantém último registro)
   var compMap = {};
-  d._contribuicoesDetalhadas.forEach(function(c){ compMap[c.comp] = c; });
-  d._contribuicoesDetalhadas = Object.values(compMap).sort(function(a,b){
-    var pa=a.comp.split('/'), pb=b.comp.split('/');
-    return (parseInt(pa[1])*12+parseInt(pa[0])) - (parseInt(pb[1])*12+parseInt(pb[0]));
+  d._contribuicoesDetalhadas.forEach(function(c) { compMap[c.comp] = c; });
+  d._contribuicoesDetalhadas = Object.values(compMap).sort(function(a, b) {
+    var pa = a.comp.split('/'), pb = b.comp.split('/');
+    return (parseInt(pa[1]) * 12 + parseInt(pa[0])) - (parseInt(pb[1]) * 12 + parseInt(pb[0]));
   });
-  d._contribuicoes = d._contribuicoesDetalhadas.map(function(c){ return c.comp; });
+  d._contribuicoes = d._contribuicoesDetalhadas.map(function(c) { return c.comp; });
 
   // Totais
   d._totalContribuicoes = d._contribuicoes.length;
   d._totalContribuicoesValidas = contarCarenciaValida(d._contribuicoesDetalhadas);
-
-  // Contribuições inválidas (PSC + abaixo SM)
-  var invalidas = d._contribuicoesDetalhadas.filter(function(c){ return !contribuicaoValida(c); });
+  var invalidas = d._contribuicoesDetalhadas.filter(function(c) { return !contribuicaoValida(c); });
   d._contribuicoesInvalidas = invalidas.length;
-  d._temPSC = invalidas.some(function(c){ return (c.indicadores||'').indexOf('PSC-MEN-SM-EC103')>=0; });
+  d._temPSC = invalidas.some(function(c) { return (c.indicadores||'').indexOf('PSC-MEN-SM-EC103')>=0; });
 
-  // ── Datas extremas ────────────────────────────────────────────────
+  // ── Datas extremas + qualidade de segurado ──
   if (d._vinculos.length) {
-    function toD(s){ var p=s.split('/'); return new Date(parseInt(p[2]),parseInt(p[1])-1,parseInt(p[0])); }
-    var maisAnt = d._vinculos.reduce(function(a,v){ return toD(v.inicio)<toD(a.inicio)?v:a; });
-    var maisRec = d._vinculos.reduce(function(a,v){ return toD(v.fim)>toD(a.fim)?v:a; });
+    function toD(s) {
+      if (!s) return new Date(9999, 0, 1);
+      var p = s.split('/');
+      return new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
+    }
+    var maisAnt = d._vinculos.reduce(function(a, v) { return toD(v.inicio) < toD(a.inicio) ? v : a; });
+    var abertos = d._vinculos.filter(function(v) { return !v.fim; });
+    var maisRec;
+    if (abertos.length > 0) {
+      maisRec = abertos.reduce(function(a, v) { return toD(v.inicio) > toD(a.inicio) ? v : a; });
+      d._temVinculoAberto = true;
+    } else {
+      maisRec = d._vinculos.reduce(function(a, v) { return toD(v.fim) > toD(a.fim) ? v : a; });
+      d._temVinculoAberto = false;
+    }
     d.dataInicioAtividade = maisAnt.inicio;
     d.dataMaisAntiga      = maisAnt.inicio;
-    d._ultimoVinculo      = maisRec.fim;
+    d._ultimoVinculo      = maisRec.fim || 'EM ABERTO';
 
-    // Período de graça (baseado no último vínculo)
-    var hoje  = new Date();
-    var ultDt = toD(maisRec.fim);
-    var meses = (hoje.getFullYear()-ultDt.getFullYear())*12+(hoje.getMonth()-ultDt.getMonth());
+    var hoje = new Date();
+    var meses = 0;
+    if (maisRec.fim && maisRec.fim !== 'EM ABERTO') {
+      var ultDt = toD(maisRec.fim);
+      meses = (hoje.getFullYear()-ultDt.getFullYear())*12+(hoje.getMonth()-ultDt.getMonth());
+    }
     d._mesesDesdeUltimo = meses;
 
-    // Última contribuição VÁLIDA (separada do último vínculo)
     var ultimaValida = ultimaContribuicaoValida(d._contribuicoesDetalhadas);
     d._ultimaContribuicaoValida = ultimaValida;
 
-    // Situação de qualidade de segurado
     var limGraca = (d._totalContribuicoesValidas >= 120) ? 24 : 12;
-    var mesesUltValida = ultimaValida ? (function(){
+    var mesesUltValida = ultimaValida ? (function() {
       var p = ultimaValida.split('/');
       var dtV = new Date(parseInt(p[1]), parseInt(p[0])-1, 1);
       return (hoje.getFullYear()-dtV.getFullYear())*12+(hoje.getMonth()-dtV.getMonth());
     })() : 9999;
 
-    d.situacaoDocumento = meses <= 12
-      ? 'QUALIDADE MANTIDA - vinculo recente (' + meses + 'm)'
+    d.situacaoDocumento = d._temVinculoAberto
+      ? 'QUALIDADE MANTIDA - vinculo ATIVO (sem data fim)'
+      : meses <= 12
+        ? 'QUALIDADE MANTIDA - vinculo recente (' + meses + 'm)'
+        : mesesUltValida <= limGraca
+          ? 'QUALIDADE MANTIDA - periodo de graca (' + mesesUltValida + 'm desde ultima contrib. valida)'
+          : 'SEM QUALIDADE - periodo de graca expirado ('
+            + meses + 'm desde ultimo vinculo, ' + mesesUltValida + 'm desde ultima contrib. valida)';
+  } else if (d._contribuicoesDetalhadas.length > 0) {
+    // FALLBACK: se vínculos não foram detectados mas há contribuições,
+    // usa as competências para inferir qualidade
+    var hoje = new Date();
+    var ultimaValida = ultimaContribuicaoValida(d._contribuicoesDetalhadas);
+    d._ultimaContribuicaoValida = ultimaValida;
+    var mesesUltValida = ultimaValida ? (function() {
+      var p = ultimaValida.split('/');
+      var dtV = new Date(parseInt(p[1]), parseInt(p[0])-1, 1);
+      return (hoje.getFullYear()-dtV.getFullYear())*12+(hoje.getMonth()-dtV.getMonth());
+    })() : 9999;
+    d._mesesDesdeUltimo = mesesUltValida;
+    var limGraca = (d._totalContribuicoesValidas >= 120) ? 24 : 12;
+    // Se última contribuição foi < 3 meses, provavelmente vínculo ativo
+    d._temVinculoAberto = mesesUltValida <= 3;
+    d.situacaoDocumento = mesesUltValida <= 3
+      ? 'QUALIDADE MANTIDA - contribuicoes recentes'
       : mesesUltValida <= limGraca
-        ? 'QUALIDADE MANTIDA - periodo de graca (' + mesesUltValida + 'm desde ultima contrib. valida)'
-        : 'SEM QUALIDADE - periodo de graca expirado ('
-          + meses + 'm desde ultimo vinculo, ' + mesesUltValida + 'm desde ultima contrib. valida)';
+        ? 'QUALIDADE MANTIDA - periodo de graca'
+        : 'SEM QUALIDADE - graca expirada (' + mesesUltValida + 'm)';
   }
 
-  // ── Tipo de atividade ─────────────────────────────────────────────
+  // Tipo de atividade
   var tipoSeg = tipoSegurado(d._vinculos);
   d._tipoSegurado = tipoSeg;
   var temEmp = tipoSeg === 'EMPREGADO' || tipoSeg === 'MISTO';
@@ -5088,15 +5215,19 @@ function extrairCNIS(t) {
     + ' | Contrib. VALIDAS: ' + d._totalContribuicoesValidas
     + (d._contribuicoesInvalidas ? ' | INVALIDAS (PSC/SM): ' + d._contribuicoesInvalidas : '')
     + (d._ultimaContribuicaoValida ? ' | Ultima valida: ' + d._ultimaContribuicaoValida : '');
+
+  try {
+    console.log('[CNIS extrator v4.0]',
+      '| Vínculos:', d._vinculos.length,
+      '| Comp. totais:', d._totalContribuicoes,
+      '| Comp. VÁLIDAS:', d._totalContribuicoesValidas,
+      '| Tempo:', Math.floor(d._totalContribuicoesValidas/12) + 'a ' + (d._totalContribuicoesValidas%12) + 'm',
+      '| Último:', d._ultimaContribuicaoValida || 'n/d',
+      '| Aberto:', d._temVinculoAberto);
+  } catch(e) {}
+
   return d;
 }
-
-
-
-
-
-
-
 function extrairCertEleitoral(t) {
   var d = {
     tipoDocumento: 'Certidão de Quitação Eleitoral',
@@ -8392,7 +8523,7 @@ async function ocrPDF(arquivo) {
   try {
     const buf = await arquivo.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-    const numPags = Math.min(pdf.numPages, 5); // máx 5 páginas para performance
+    const numPags = pdf.numPages; // TODAS as páginas (fix: antes limitava a 5)
     let textoTotal = '';
 
     for (let p = 1; p <= numPags; p++) {
@@ -8457,29 +8588,45 @@ async function lerArquivoComOCR(arquivo) {
     log('OCR CAMADA 2', 'Tesseract insuficiente (' + textoOCR.length + ' chars) → tentando Vision IA');
   }
 
-  // ── CAMADA 3: EasyOCR via backend (mais preciso que Tesseract) ─────
+  // ── CAMADA 3: EasyOCR via backend — TODAS as páginas (fix) ─────
   var backendOk = window._backendStatus === 'ok' || window._backendStatus === true;
   if (backendOk) {
     try {
-      setStatus('OCR avançado (EasyOCR)...', 'yellow');
-      // Pega a imagem base64 da primeira página
-      var imgB64Easy = await pdfParaImagemBase64(arquivo).catch(function(){ return null; });
-      if (imgB64Easy) {
-        var resp = await fetch('http://localhost:5000/api/ocr', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imagem_base64: imgB64Easy }),
-          signal: AbortSignal.timeout(30000),
-        });
-        if (resp.ok) {
-          var data = await resp.json();
-          if (data.sucesso && data.texto && data.texto.length > 80) {
-            var textoEasy = corrigirOCR(data.texto);
-            log('OCR EASYOCR', 'Confiança: ' + (data.confianca*100).toFixed(0) + '% | ' + data.linhas + ' linhas');
-            return textoEasy;
+      setStatus('OCR avançado (EasyOCR) — carregando páginas...', 'yellow');
+      var imagensEasy = await pdfParaImagensTodasPaginas(arquivo).catch(function(){ return []; });
+      if (imagensEasy.length > 0) {
+        var textoEasyTotal = '';
+        var totalLinhas = 0;
+        var somaConf = 0, contConf = 0;
+        for (var iE = 0; iE < imagensEasy.length; iE++) {
+          setStatus('EasyOCR pág. ' + (iE+1) + '/' + imagensEasy.length + '...', 'yellow');
+          try {
+            var resp = await fetch('http://localhost:5000/api/ocr', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ imagem_base64: imagensEasy[iE] }),
+              signal: AbortSignal.timeout(45000),
+            });
+            if (resp.ok) {
+              var data = await resp.json();
+              if (data.sucesso && data.texto) {
+                textoEasyTotal += '\n--- Página ' + (iE+1) + ' ---\n' + data.texto;
+                totalLinhas += (data.linhas || 0);
+                if (data.confianca) { somaConf += data.confianca; contConf++; }
+              }
+            } else if (resp.status === 503) {
+              log('EASYOCR', 'Não instalado — use: pip install easyocr');
+              break;
+            }
+          } catch(eP) {
+            log('EASYOCR pág ' + (iE+1), eP.message);
           }
-        } else if (resp.status === 503) {
-          log('EASYOCR', 'Não instalado — use: pip install easyocr');
+        }
+        if (textoEasyTotal.length > 80) {
+          var textoEasy = corrigirOCR(textoEasyTotal);
+          var confMedia = contConf ? (somaConf/contConf*100).toFixed(0) : '?';
+          log('OCR EASYOCR', imagensEasy.length + ' páginas | Conf ' + confMedia + '% | ' + totalLinhas + ' linhas');
+          return textoEasy;
         }
       }
     } catch(eEasy) {
@@ -8487,21 +8634,32 @@ async function lerArquivoComOCR(arquivo) {
     }
   }
 
-  // ── CAMADA 4: Vision IA (Llama-4-Scout / Groq — grátis) ──────────
+  // ── CAMADA 4: Vision IA (Groq) — TODAS as páginas (fix) ──────────
   const groqKey = gk('ap-groq-key');
   if (groqKey) {
     try {
-      const imgB64 = await pdfParaImagemBase64(arquivo);
-      if (imgB64) {
-        setStatus('OCR Vision IA (Llama-4-Scout)...', 'yellow');
+      setStatus('OCR Vision IA — carregando páginas...', 'yellow');
+      const imagensVision = await pdfParaImagensTodasPaginas(arquivo);
+      if (imagensVision && imagensVision.length > 0) {
         const promptOCR = 'Este é um documento previdenciário brasileiro escaneado. '
           + 'Extraia TODO o texto visível, mantendo a estrutura. '
           + 'Preserve: nomes, CPFs, datas, números de registro, municípios, situações. '
           + 'Responda apenas com o texto extraído, sem comentários.';
-        const textoVision = await chamarIAVision(imgB64, promptOCR);
-        if (textoVision && textoVision.length > 80) {
-          const textoFinal = corrigirOCR(textoVision);
-          log('OCR CAMADA 3', 'Vision IA OK — ' + textoFinal.length + ' chars');
+        let textoVisionTotal = '';
+        for (let iV = 0; iV < imagensVision.length; iV++) {
+          setStatus('Vision IA pág. ' + (iV+1) + '/' + imagensVision.length + '...', 'yellow');
+          try {
+            const tv = await chamarIAVision(imagensVision[iV], promptOCR);
+            if (tv && tv.length > 20) {
+              textoVisionTotal += '\n--- Página ' + (iV+1) + ' ---\n' + tv;
+            }
+          } catch(ePV) {
+            log('Vision IA pág ' + (iV+1), ePV.message);
+          }
+        }
+        if (textoVisionTotal.length > 80) {
+          const textoFinal = corrigirOCR(textoVisionTotal);
+          log('OCR CAMADA 3', 'Vision IA OK — ' + imagensVision.length + ' páginas, ' + textoFinal.length + ' chars');
           return textoFinal;
         }
       }
@@ -17111,2674 +17269,369 @@ console.log('[A&P ML v2] ✅ Aprendizado validado com feedback loop');
 })();
 </script>
 
+
+
+
+
+
 <!-- ═══════════════════════════════════════════════════════════
-     A&P PLANEJAMENTO PREVIDENCIÁRIO v1.0 — Fase 1 MVP
-     
-     Nova aba "Planejamento" após "Parecer" na sidebar.
-     
-     Quando clicar:
-     1. Se não tiver CNIS analisado → empty state com instruções
-     2. Se tiver → cabeçalho do segurado + tabela comparativa
-     
-     Calcula para cada benefício programável:
-     - Tempo de contribuição atual
-     - Carência atual
-     - Direito adquirido (sim/não/data futura)
-     - Status visual (verde/âmbar/vermelho)
-     - Faltantes (idade, tempo, carência)
-     - Próxima data de elegibilidade
+     A&P EXPORT para PLANEJAMENTO v1.0
+     Gera JSON compatível com o site A&P Planejamento
      ═══════════════════════════════════════════════════════════ -->
 <style>
-/* ═══ Planejamento — UI ═══ */
-#tab-planejamento {
-  padding: 24px 20px 40px;
-}
-.plan-header {
-  background: linear-gradient(135deg,
-    rgba(201,168,76,.08) 0%,
-    rgba(61,127,255,.04) 100%);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 20px 24px;
-  margin-bottom: 20px;
-}
-.plan-seg-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 16px;
-}
-.plan-seg-item {
-  display: flex; flex-direction: column; gap: 4px;
-}
-.plan-seg-label {
-  font-family: var(--mono);
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: .15em;
-  color: var(--muted2);
-}
-.plan-seg-valor {
-  font-family: var(--serif);
-  font-size: 16px;
-  color: var(--text);
-  font-weight: 500;
-  letter-spacing: -.01em;
-}
-.plan-seg-valor.dourado {
-  color: var(--gold);
-  font-size: 18px;
-}
-
-/* Resumo */
-.plan-resumo {
-  padding: 14px 18px;
-  margin-bottom: 16px;
-  border-radius: 10px;
-  border-left: 3px solid var(--amber);
-  background: rgba(240,160,48,.06);
-  font-size: 13px;
-  color: var(--text);
-  line-height: 1.6;
-}
-.plan-resumo.ok {
-  border-left-color: var(--green);
-  background: rgba(34,201,122,.06);
-}
-
-/* Tabela de benefícios */
-.plan-tabela {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  margin-bottom: 20px;
-}
-.plan-th {
-  background: linear-gradient(90deg, rgba(13,31,60,.9), rgba(13,31,60,.7));
-  padding: 12px 16px;
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: .15em;
-  color: var(--gold);
-  font-weight: 700;
-  text-transform: uppercase;
-  border-bottom: 1px solid rgba(201,168,76,.15);
-  display: flex;
+.expplan-btn {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-}
-.plan-tabela table {
-  width: 100%;
-}
-.plan-tabela th {
-  padding: 10px 14px !important;
-  background: transparent !important;
-  border-bottom: 1px solid var(--border) !important;
-}
-.plan-tabela td {
-  padding: 14px !important;
-  font-size: 12.5px !important;
-}
-.plan-b-nome {
-  font-family: var(--serif);
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--text);
-  letter-spacing: -.005em;
-}
-.plan-b-sub {
-  font-size: 10.5px;
-  color: var(--muted2);
-  margin-top: 2px;
-}
-
-/* Badges de status */
-.plan-badge {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px;
-  border-radius: 16px;
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .08em;
-  white-space: nowrap;
-}
-.plan-badge.direito     { background: rgba(34,201,122,.15); color: var(--green); border: 1px solid rgba(34,201,122,.3); }
-.plan-badge.quase       { background: rgba(240,160,48,.15); color: var(--amber); border: 1px solid rgba(240,160,48,.3); }
-.plan-badge.sem-direito { background: rgba(224,82,82,.1);  color: #e67070;       border: 1px solid rgba(224,82,82,.2); }
-.plan-badge.futuro      { background: rgba(61,127,255,.12); color: var(--blue);  border: 1px solid rgba(61,127,255,.25); }
-
-.plan-progresso {
-  height: 4px;
-  background: rgba(255,255,255,.05);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-top: 6px;
-}
-.plan-progresso-fill {
-  height: 100%;
-  transition: width .4s var(--ease);
-}
-.plan-progresso-fill.baixo { background: #e05252; }
-.plan-progresso-fill.medio { background: var(--amber); }
-.plan-progresso-fill.alto  { background: var(--green); }
-
-.plan-falta {
-  font-size: 11px;
-  color: var(--muted2);
-  font-family: var(--mono);
-}
-
-/* Oportunidades */
-.plan-oport {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  margin-bottom: 20px;
-}
-.plan-oport-item {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border);
-  display: flex; gap: 12px;
-}
-.plan-oport-item:last-child { border-bottom: none; }
-.plan-oport-icon {
-  font-size: 22px;
-  opacity: .8;
-  flex-shrink: 0;
-}
-.plan-oport-titulo {
-  font-size: 13px; color: var(--text); font-weight: 600;
-  margin-bottom: 3px;
-}
-.plan-oport-desc {
-  font-size: 11.5px; color: var(--muted2); line-height: 1.5;
-}
-
-/* Empty state */
-.plan-empty {
-  text-align: center;
-  padding: 80px 20px;
-  color: var(--muted2);
-  font-family: var(--serif);
-}
-.plan-empty-icon {
-  font-size: 48px;
-  margin-bottom: 18px;
-  opacity: .5;
-}
-.plan-empty-title {
-  font-size: 20px;
-  color: var(--muted2);
-  margin-bottom: 10px;
-  letter-spacing: -.01em;
-}
-.plan-empty-desc {
-  font-size: 13px;
-  font-family: var(--sans);
-  line-height: 1.6;
-  max-width: 480px;
-  margin: 0 auto;
-}
-.plan-empty-cta {
-  margin-top: 20px;
-  padding: 10px 20px;
   background: linear-gradient(180deg, var(--gold), #b8962f);
   color: #0a0d15;
   border: none;
+  padding: 9px 16px;
   border-radius: 8px;
-  cursor: pointer;
+  font-family: var(--sans);
   font-weight: 600;
   font-size: 12px;
-  font-family: var(--sans);
-}
-
-/* Alternância por abas de tipo de regra (programáveis vs não) */
-.plan-subtabs {
-  display: flex;
-  gap: 2px;
-  margin-bottom: 14px;
-  border-bottom: 1px solid var(--border);
-}
-.plan-subtab {
-  background: transparent;
-  border: none;
-  color: var(--muted2);
-  padding: 10px 16px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: .12em;
-  text-transform: uppercase;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
-  transition: all .2s var(--ease);
+  transition: filter .2s var(--ease);
 }
-.plan-subtab.ativa {
-  color: var(--gold);
-  border-bottom-color: var(--gold);
-}
-.plan-subtab:hover { color: var(--text); }
+.expplan-btn:hover { filter: brightness(1.08); }
+.expplan-btn:disabled { opacity: .5; cursor: not-allowed; }
 </style>
 
 <script>
 'use strict';
-// ═══════════════════════════════════════════════════════════
-// A&P PLANEJAMENTO PREVIDENCIÁRIO v1.0
-// ═══════════════════════════════════════════════════════════
 (function() {
 
-// ─── UTILS ───────────────────────────────────────────────────
-function _parseDataBR(str) {
-  if (!str) return null;
-  var m = String(str).match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (!m) return null;
-  return new Date(parseInt(m[3]), parseInt(m[2])-1, parseInt(m[1]));
-}
-
-function _fmtData(d) {
-  if (!d || !(d instanceof Date) || isNaN(d)) return '—';
-  return String(d.getDate()).padStart(2,'0') + '/' +
-         String(d.getMonth()+1).padStart(2,'0') + '/' +
-         d.getFullYear();
-}
-
-function _mesesEntre(d1, d2) {
-  if (!d1 || !d2) return 0;
-  var meses = (d2.getFullYear() - d1.getFullYear()) * 12 + (d2.getMonth() - d1.getMonth());
-  if (d2.getDate() < d1.getDate()) meses--;
-  return Math.max(0, meses);
-}
-
-function _anosEntre(d1, d2) {
-  if (!d1 || !d2) return 0;
-  var anos = d2.getFullYear() - d1.getFullYear();
-  if (d2.getMonth() < d1.getMonth() || (d2.getMonth() === d1.getMonth() && d2.getDate() < d1.getDate())) anos--;
-  return Math.max(0, anos);
-}
-
-function _fmtTempo(meses) {
-  if (!meses || meses < 0) return '0 anos, 0 meses';
-  var a = Math.floor(meses / 12);
-  var m = meses % 12;
-  return a + ' ano' + (a !== 1 ? 's' : '') + ', ' + m + ' mes' + (m !== 1 ? 'es' : '');
-}
-
-function _detSexo(dados) {
-  // Tenta pelo nome ou pelo qualificativo profissional
-  var nome = (dados.nomeCliente || '').toLowerCase();
-  var qualif = (dados.qualificacaoProfissional || '').toLowerCase();
-  if (/\ba$/.test(qualif)) return 'feminino';   // ex: lavradora, pescadora
-  if (/\bo$/.test(qualif)) return 'masculino';  // ex: lavrador, pescador
-  // Heurística simples pelo primeiro nome
-  var primeiro = nome.split(' ')[0];
-  if (/a$/i.test(primeiro) && primeiro.length > 3) return 'feminino';
-  return 'masculino'; // default conservador
-}
-
-// ─── DEFINIÇÕES DE BENEFÍCIOS ────────────────────────────────
-// Cada regra sabe calcular: tem direito, tempo que falta, data de elegibilidade
-var REGRAS_APOSENTADORIA = [
-  {
-    id: 'idade_urbana',
-    nome: 'Aposentadoria por Idade Urbana',
-    sub: 'Art. 48 Lei 8.213/91 (pós-EC 103/2019)',
-    aplicavel: function(d) { return true; }, // todos podem tentar
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var idadeMinima = sexo === 'feminino' ? 62 : 65;
-      var carenciaMinima = 180; // 15 anos
-
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var carenciaAtual = ctx.carencia;
-
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaCarencia = Math.max(0, carenciaMinima - carenciaAtual);
-
-      var temDireito = faltaIdade <= 0 && faltaCarencia <= 0;
-
-      // Quando terá direito?
-      var dataDireito = null;
-      if (!temDireito && ctx.dataNascimento) {
-        var d = new Date(ctx.dataNascimento);
-        d.setFullYear(d.getFullYear() + idadeMinima);
-        // Se tiver que aguardar mais carência que idade, pega o maior dos dois
-        if (faltaCarencia * 30.44 > faltaIdade * 365.25) {
-          d = new Date(ctx.hoje);
-          d.setMonth(d.getMonth() + Math.ceil(faltaCarencia));
-        }
-        dataDireito = d;
-      }
-
-      return {
-        temDireito: temDireito,
-        tempoContrib: ctx.tempoContribMeses,
-        carencia: carenciaAtual,
-        carenciaMinima: carenciaMinima,
-        idadeMinima: idadeMinima,
-        faltaIdade: Math.ceil(faltaIdade * 12), // em meses
-        faltaCarencia: faltaCarencia,
-        dataDireito: dataDireito,
-        progresso: temDireito ? 100 : Math.round((Math.min(idadeAtual/idadeMinima, 1) * 50) + (Math.min(carenciaAtual/carenciaMinima, 1) * 50)),
-      };
-    },
-  },
-  {
-    id: 'tempo_contribuicao_idade',
-    nome: 'Aposentadoria por Tempo + Idade (transição)',
-    sub: 'EC 103/2019 — Regra de pontos (Art. 15)',
-    aplicavel: function(d) { return d.temContribAnterior2019; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      // Regra dos pontos cresce 1 por ano desde 2020
-      var anoAtual = new Date().getFullYear();
-      var pontosMinimos = (sexo === 'feminino' ? 88 : 98) + Math.max(0, anoAtual - 2020);
-      var tempoMinimo = sexo === 'feminino' ? 360 : 420; // 30/35 anos
-
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var tempoAtual = ctx.tempoContribMeses / 12;
-      var pontosAtuais = Math.floor(idadeAtual + tempoAtual);
-
-      var faltamPontos = Math.max(0, pontosMinimos - pontosAtuais);
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-
-      var temDireito = faltamPontos <= 0 && faltaTempo <= 0;
-
-      return {
-        temDireito: temDireito,
-        tempoContrib: ctx.tempoContribMeses,
-        tempoMinimo: tempoMinimo,
-        pontosAtuais: pontosAtuais,
-        pontosMinimos: pontosMinimos,
-        faltamPontos: faltamPontos,
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(pontosAtuais/pontosMinimos, 1) * 100),
-      };
-    },
-  },
-  {
-    id: 'idade_rural',
-    nome: 'Aposentadoria por Idade Rural',
-    sub: 'Art. 48 §1º Lei 8.213/91',
-    aplicavel: function(d) { return d.tipoAtividade === 'RURAL' || d._rural; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var idadeMinima = sexo === 'feminino' ? 55 : 60;
-      var carenciaMinima = 180; // 15 anos de atividade rural comprovada
-
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var carenciaAtual = ctx.carencia;
-
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaCarencia = Math.max(0, carenciaMinima - carenciaAtual);
-
-      var temDireito = faltaIdade <= 0 && faltaCarencia <= 0;
-
-      return {
-        temDireito: temDireito,
-        tempoContrib: ctx.tempoContribMeses,
-        carencia: carenciaAtual,
-        carenciaMinima: carenciaMinima,
-        idadeMinima: idadeMinima,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaCarencia: faltaCarencia,
-        progresso: temDireito ? 100 : Math.round((Math.min(idadeAtual/idadeMinima, 1) * 50) + (Math.min(carenciaAtual/carenciaMinima, 1) * 50)),
-      };
-    },
-  },
-  {
-    id: 'pedagio_50',
-    nome: 'Pedágio 50%',
-    sub: 'EC 103/2019 — Art. 17',
-    aplicavel: function(d) {
-      if (!d.temContribAnterior2019) return false;
-      // Precisava estar a < 2 anos da regra antiga em 13/11/2019
-      var sexo = _detSexo(d);
-      var tempoMinAntigo = sexo === 'feminino' ? 360 : 420;
-      return d.tempoContrib2019 && d.tempoContrib2019 >= (tempoMinAntigo - 24);
-    },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var tempoMinAntigo = sexo === 'feminino' ? 360 : 420;
-      var faltavaEm2019 = Math.max(0, tempoMinAntigo - (ctx.tempoContrib2019 || 0));
-      var pedagio = Math.ceil(faltavaEm2019 * 1.5); // tempo que faltava + 50%
-      var tempoMinimo = (ctx.tempoContrib2019 || 0) + pedagio;
-
-      var temDireito = ctx.tempoContribMeses >= tempoMinimo;
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-
-      return {
-        temDireito: temDireito,
-        tempoMinimo: tempoMinimo,
-        tempoContrib: ctx.tempoContribMeses,
-        pedagio: pedagio,
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo, 1) * 100),
-      };
-    },
-  },
-];
-
-// ─── CONTEXTO DO SEGURADO ───────────────────────────────────
-function _montarContextoSegurado(dadosExtraidos, todosDocDados) {
-  var cnis = (todosDocDados || []).find(function(d) {
-    return d && (d._tipoDetectado === 'cnis' || /cnis|extrato/i.test(d.tipoDocumento || ''));
-  });
-  if (!cnis) cnis = dadosExtraidos;
-
-  var hoje = new Date();
-  var dataNasc = _parseDataBR(dadosExtraidos.dataNascimento || cnis.dataNascimento);
-  var idadeAtualMeses = dataNasc ? _mesesEntre(dataNasc, hoje) : 0;
-
-  var tempoContribMeses = cnis._totalContribuicoesValidas || cnis._totalContribuicoes || 0;
-  var carencia = cnis._totalContribuicoesValidas || 0;
-
-  // Verifica se tem contribuição anterior a 13/11/2019 (para regras de transição)
-  var reformaData = new Date(2019, 10, 13); // 13/11/2019
-  var temContribAnterior2019 = false;
-  var tempoContrib2019 = 0;
-
-  if (cnis._contribuicoesDetalhadas) {
-    cnis._contribuicoesDetalhadas.forEach(function(c) {
-      var d = _parseDataBR(c.competencia) || (c.ano ? new Date(c.ano, (c.mes||1)-1, 1) : null);
-      if (d && d < reformaData) {
-        temContribAnterior2019 = true;
-        tempoContrib2019++;
-      }
-    });
+// ─── Formata dados para export ───────────────────────────
+function _apExportarPlanejamento() {
+  if (typeof dadosExtraidos === 'undefined' || !dadosExtraidos) {
+    toast('⚠ Analise um CNIS primeiro');
+    return;
   }
-
-  return {
-    nomeCliente: dadosExtraidos.nomeCliente || cnis.nomeCliente || '—',
-    cpf: dadosExtraidos.cpfCnpj || cnis.cpfCnpj || '—',
-    dataNascimento: dataNasc,
-    sexo: _detSexo(dadosExtraidos),
-    idadeAtualMeses: idadeAtualMeses,
-    tempoContribMeses: tempoContribMeses,
-    carencia: carencia,
-    tipoAtividade: cnis.tipoAtividade || dadosExtraidos.tipoAtividade,
-    temContribAnterior2019: temContribAnterior2019,
-    tempoContrib2019: tempoContrib2019,
-    hoje: hoje,
-    _temCnis: !!cnis._vinculos,
-  };
-}
-
-// ─── OPORTUNIDADES INTELIGENTES ─────────────────────────────
-function _detectarOportunidades(ctx, resultados) {
-  var ops = [];
-
-  // Oportunidade 1: faltam poucos meses para aposentadoria por idade
-  var idadeUrb = resultados.find(function(r) { return r.id === 'idade_urbana'; });
-  if (idadeUrb && !idadeUrb.resultado.temDireito) {
-    var faltaI = idadeUrb.resultado.faltaIdade || 0;
-    var faltaC = idadeUrb.resultado.faltaCarencia || 0;
-    if (faltaI <= 12 && faltaC === 0) {
-      ops.push({
-        icon: '🎯',
-        titulo: 'Aposentadoria por Idade Urbana em menos de 1 ano',
-        desc: 'Faltam apenas ' + faltaI + ' meses de idade. Carência já cumprida. Data estimada: ' + _fmtData(idadeUrb.resultado.dataDireito),
-      });
-    } else if (faltaC <= 12 && faltaI === 0) {
-      ops.push({
-        icon: '💼',
-        titulo: 'Carência quase completa',
-        desc: 'Faltam apenas ' + faltaC + ' contribuições para atingir a carência mínima de 180 meses. Considerar contribuir como facultativo.',
-      });
-    }
-  }
-
-  // Oportunidade 2: próximo dos pontos
-  var pts = resultados.find(function(r) { return r.id === 'tempo_contribuicao_idade'; });
-  if (pts && pts.resultado.faltamPontos > 0 && pts.resultado.faltamPontos <= 3) {
-    ops.push({
-      icon: '📈',
-      titulo: 'Próximo da regra dos pontos',
-      desc: 'Faltam apenas ' + pts.resultado.faltamPontos + ' pontos. Verificar se vale a pena aguardar a regra ou optar por outra modalidade.',
-    });
-  }
-
-  // Oportunidade 3: tem pedágio disponível
-  var ped = resultados.find(function(r) { return r.id === 'pedagio_50'; });
-  if (ped && ped.aplicavel && !ped.resultado.temDireito) {
-    ops.push({
-      icon: '⏳',
-      titulo: 'Regra do Pedágio 50% aplicável',
-      desc: 'Segurado estava a menos de 2 anos da regra antiga em 13/11/2019. Pedágio estimado: ' + Math.ceil(ped.resultado.pedagio/12) + ' anos. Avaliar se é mais vantajoso que outras regras.',
-    });
-  }
-
-  // Oportunidade 4: atividade rural sem carência mínima — orientar
-  if (ctx.tipoAtividade === 'RURAL' && ctx.carencia < 180) {
-    var faltaRural = 180 - ctx.carencia;
-    ops.push({
-      icon: '🌾',
-      titulo: 'Atividade rural — faltam ' + faltaRural + ' meses de comprovação',
-      desc: 'Para aposentadoria rural, é necessário comprovar 180 meses (15 anos) de atividade rural. Buscar documentos complementares: CAR, CAEPF, declaração sindical, bloco de produtor.',
-    });
-  }
-
-  // Oportunidade 5: direito adquirido já na regra antiga (pré-2019)
-  if (ctx.tempoContrib2019 && ctx.tempoContrib2019 >= (ctx.sexo === 'feminino' ? 360 : 420)) {
-    ops.push({
-      icon: '⚖️',
-      titulo: 'Direito adquirido antes da Reforma',
-      desc: 'Segurado já tinha ' + _fmtTempo(ctx.tempoContrib2019) + ' em 13/11/2019, suficiente para a regra antiga de aposentadoria por tempo de contribuição. Direito adquirido garantido pelo Art. 3º EC 103/2019.',
-    });
-  }
-
-  return ops;
-}
-
-// ─── CAMINHO MAIS CURTO ─────────────────────────────────────
-function _caminhoMaisCurto(resultados, ctx) {
-  // Se nenhum tem direito, aponta o que está mais próximo
-  var comDireito = resultados.filter(function(r) { return r.resultado.temDireito; });
-  if (comDireito.length > 0) {
-    return {
-      tem: true,
-      msg: 'Tem direito a ' + comDireito.length + ' benefício(s) atualmente. Ver tabela abaixo.',
-    };
-  }
-
-  // Encontra o mais próximo
-  var candidatos = resultados
-    .filter(function(r) { return r.aplicavel && r.resultado.dataDireito; })
-    .map(function(r) { return { nome: r.nome, data: r.resultado.dataDireito }; })
-    .sort(function(a,b) { return a.data - b.data; });
-
-  if (candidatos.length > 0) {
-    var prox = candidatos[0];
-    return {
-      tem: false,
-      msg: 'Ainda não tem direito a aposentadoria. Primeiro direito estimado: ' + prox.nome + ' em ' + _fmtData(prox.data) + '.',
-    };
-  }
-
-  return {
-    tem: false,
-    msg: 'Ainda não tem direito a aposentadoria programada. Sem dados suficientes para projetar data futura.',
-  };
-}
-
-// ─── RENDERIZAÇÃO ───────────────────────────────────────────
-window.renderPlanejamento = function() {
-  var root = document.getElementById('tab-planejamento');
-  if (!root) return;
-
-  // Verifica se tem CNIS
-  var dados = typeof dadosExtraidos !== 'undefined' ? dadosExtraidos : {};
   var todos = typeof _todosDocumentosDados !== 'undefined' ? _todosDocumentosDados : [];
-  var temCnis = (todos || []).some(function(d) {
+  var cnis = (todos || []).find(function(d) {
     return d && (d._tipoDetectado === 'cnis' || /cnis|extrato/i.test(d.tipoDocumento || ''));
-  });
-  if (!temCnis && dados._vinculos) temCnis = true;
+  }) || dadosExtraidos;
 
-  if (!temCnis) {
-    root.innerHTML = ''
-      + '<div class="plan-empty">'
-      + '  <div class="plan-empty-icon">📊</div>'
-      + '  <div class="plan-empty-title">Planejamento Previdenciário</div>'
-      + '  <div class="plan-empty-desc">'
-      + '    Para montar um planejamento, o sistema precisa de um <strong style="color:var(--gold);">CNIS analisado</strong>.<br>'
-      + '    Anexe o extrato previdenciário do cliente na aba <em>Início</em> e clique em Analisar.'
-      + '  </div>'
-      + '  <button class="plan-empty-cta" onclick="document.querySelector(\'[data-tab=inicio]\').click()">'
-      + '    ↗ Ir para Início'
-      + '  </button>'
-      + '</div>';
+  if (!cnis._contribuicoesDetalhadas || cnis._contribuicoesDetalhadas.length === 0) {
+    toast('⚠ Esse documento não é um CNIS analisado');
     return;
   }
 
-  var ctx = _montarContextoSegurado(dados, todos);
+  // Pacote de dados para o site de Planejamento
+  var pacote = {
+    _formato: 'ap-planejamento-v1',
+    _geradoEm: new Date().toISOString(),
+    _origem: 'A&P Análise',
+    segurado: {
+      nomeCliente: cnis.nomeCliente || dadosExtraidos.nomeCliente || '',
+      cpfCnpj:     cnis.cpfCnpj || dadosExtraidos.cpfCnpj || '',
+      dataNascimento: cnis.dataNascimento || dadosExtraidos.dataNascimento || '',
+      nomeMae:     cnis._nomeMae || '',
+      nit:         cnis._nit || '',
+    },
+    cnis: {
+      _vinculos:                   cnis._vinculos || [],
+      _contribuicoes:              cnis._contribuicoes || [],
+      _contribuicoesDetalhadas:    cnis._contribuicoesDetalhadas || [],
+      _totalContribuicoes:         cnis._totalContribuicoes || 0,
+      _totalContribuicoesValidas:  cnis._totalContribuicoesValidas || 0,
+      _contribuicoesInvalidas:     cnis._contribuicoesInvalidas || 0,
+      _ultimaContribuicaoValida:   cnis._ultimaContribuicaoValida || '',
+      _ultimoVinculo:              cnis._ultimoVinculo || '',
+      _mesesDesdeUltimo:           cnis._mesesDesdeUltimo || 0,
+      _temVinculoAberto:           cnis._temVinculoAberto || false,
+      _temPSC:                     cnis._temPSC || false,
+      _tipoSegurado:               cnis._tipoSegurado || '',
+      tipoAtividade:               cnis.tipoAtividade || '',
+      qualificacaoProfissional:    cnis.qualificacaoProfissional || '',
+      situacaoDocumento:           cnis.situacaoDocumento || '',
+      dataInicioAtividade:         cnis.dataInicioAtividade || '',
+      dataMaisAntiga:              cnis.dataMaisAntiga || '',
+    },
+  };
 
-  // Calcula cada benefício
-  var resultados = REGRAS_APOSENTADORIA.map(function(regra) {
-    var aplic = regra.aplicavel(Object.assign({}, ctx, dados));
-    return {
-      id: regra.id,
-      nome: regra.nome,
-      sub: regra.sub,
-      aplicavel: aplic,
-      resultado: aplic ? regra.calcular(ctx) : { temDireito: false, naoAplicavel: true },
-    };
-  });
+  // Baixa como JSON
+  var nome = (pacote.segurado.nomeCliente || 'cliente').replace(/\s+/g,'_').substring(0,30);
+  var blob = new Blob([JSON.stringify(pacote, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'plan_' + nome + '_' + Date.now() + '.json';
+  a.click();
 
-  var oportunidades = _detectarOportunidades(ctx, resultados);
-  var caminho = _caminhoMaisCurto(resultados, ctx);
+  if (typeof toast === 'function')
+    toast('✓ Dados exportados para Planejamento (' + pacote.cnis._totalContribuicoesValidas + ' contribuições válidas)');
+}
 
-  // HTML
-  var idadeCompleta = ctx.idadeAtualMeses > 0
-    ? Math.floor(ctx.idadeAtualMeses/12) + ' anos' + (ctx.idadeAtualMeses % 12 ? ', ' + (ctx.idadeAtualMeses % 12) + ' meses' : '')
-    : '—';
+// ─── Injeta botão na aba Parecer ─────────────────────────
+function _injetarBotaoExport() {
+  if (document.getElementById('btn-export-plan')) return;
 
-  var html = ''
-    // Cabeçalho
-    + '<div class="plan-header">'
-    + '  <div style="font-family:var(--mono);font-size:10px;letter-spacing:.15em;color:var(--gold);text-transform:uppercase;margin-bottom:10px;">📊 Planejamento Previdenciário</div>'
-    + '  <div class="plan-seg-grid">'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">Segurado</span><span class="plan-seg-valor dourado">' + ctx.nomeCliente + '</span></div>'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">CPF</span><span class="plan-seg-valor">' + ctx.cpf + '</span></div>'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">Nascimento</span><span class="plan-seg-valor">' + _fmtData(ctx.dataNascimento) + '</span></div>'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">Idade</span><span class="plan-seg-valor">' + idadeCompleta + '</span></div>'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">Tempo de Contribuição</span><span class="plan-seg-valor">' + _fmtTempo(ctx.tempoContribMeses) + '</span></div>'
-    + '    <div class="plan-seg-item"><span class="plan-seg-label">Carência</span><span class="plan-seg-valor">' + ctx.carencia + ' contribuições</span></div>'
-    + '  </div>'
-    + '</div>'
+  // Procura um local adequado: após botões de export existentes na aba parecer
+  var container = document.querySelector('#tab-parecer .row') 
+               || document.querySelector('#tab-parecer [class*="export"]')
+               || document.querySelector('#tab-parecer');
 
-    // Resumo
-    + '<div class="plan-resumo' + (caminho.tem ? ' ok' : '') + '">'
-    + (caminho.tem ? '✅ ' : 'ℹ️ ') + caminho.msg
-    + '</div>'
-
-    // Tabela de benefícios
-    + '<div class="plan-tabela">'
-    + '  <div class="plan-th">📋 Aposentadorias Programáveis</div>'
-    + '  <table>'
-    + '    <thead>'
-    + '      <tr>'
-    + '        <th style="width:30%;">Benefício</th>'
-    + '        <th style="width:20%;">Requisitos Mínimos</th>'
-    + '        <th style="width:20%;">Situação Atual</th>'
-    + '        <th style="width:15%;">Falta</th>'
-    + '        <th style="width:15%;">Status</th>'
-    + '      </tr>'
-    + '    </thead>'
-    + '    <tbody>';
-
-  resultados.forEach(function(r) {
-    var res = r.resultado;
-    // Requisitos
-    var reqTxt = '';
-    if (res.idadeMinima)    reqTxt += '<div>Idade: ' + res.idadeMinima + ' anos</div>';
-    if (res.tempoMinimo)    reqTxt += '<div>Tempo: ' + _fmtTempo(res.tempoMinimo) + '</div>';
-    if (res.carenciaMinima) reqTxt += '<div>Carência: ' + res.carenciaMinima + ' meses</div>';
-    if (res.pontosMinimos)  reqTxt += '<div>Pontos: ' + res.pontosMinimos + '</div>';
-    if (!reqTxt) reqTxt = '<span style="color:var(--muted);">—</span>';
-
-    // Situação atual
-    var sitTxt = '';
-    if (res.idadeMinima)    sitTxt += '<div>Idade: ' + Math.floor(ctx.idadeAtualMeses/12) + ' anos</div>';
-    if (res.tempoMinimo || res.tempoContrib) sitTxt += '<div>Tempo: ' + _fmtTempo(ctx.tempoContribMeses) + '</div>';
-    if (res.carenciaMinima) sitTxt += '<div>Carência: ' + ctx.carencia + '</div>';
-    if (res.pontosAtuais !== undefined) sitTxt += '<div>Pontos: ' + res.pontosAtuais + '</div>';
-    if (!sitTxt) sitTxt = '<span style="color:var(--muted);">—</span>';
-
-    // Falta
-    var faltaTxt = '';
-    if (res.faltaIdade > 0)    faltaTxt += '<div>' + Math.ceil(res.faltaIdade/12) + ' anos de idade</div>';
-    if (res.faltaTempo > 0)    faltaTxt += '<div>' + _fmtTempo(res.faltaTempo) + '</div>';
-    if (res.faltaCarencia > 0) faltaTxt += '<div>' + res.faltaCarencia + ' contribuições</div>';
-    if (res.faltamPontos > 0)  faltaTxt += '<div>' + res.faltamPontos + ' pontos</div>';
-    if (!faltaTxt && res.temDireito) faltaTxt = '<span style="color:var(--green);">— nada</span>';
-    if (!faltaTxt) faltaTxt = '<span style="color:var(--muted);">—</span>';
-
-    // Badge + progresso
-    var badge, prog = res.progresso || 0;
-    var progClasse = prog >= 90 ? 'alto' : prog >= 50 ? 'medio' : 'baixo';
-    if (!r.aplicavel) {
-      badge = '<span class="plan-badge sem-direito">N/A</span>';
-    } else if (res.temDireito) {
-      badge = '<span class="plan-badge direito">✓ TEM DIREITO</span>';
-    } else if (prog >= 80) {
-      badge = '<span class="plan-badge quase">Próximo</span>';
-    } else if (res.dataDireito) {
-      badge = '<span class="plan-badge futuro">Em ' + _fmtData(res.dataDireito) + '</span>';
-    } else {
-      badge = '<span class="plan-badge sem-direito">Longe</span>';
-    }
-
-    html += ''
-      + '<tr>'
-      + '  <td>'
-      + '    <div class="plan-b-nome">' + r.nome + '</div>'
-      + '    <div class="plan-b-sub">' + r.sub + '</div>'
-      + '  </td>'
-      + '  <td style="font-size:11.5px;line-height:1.5;">' + reqTxt + '</td>'
-      + '  <td style="font-size:11.5px;line-height:1.5;">' + sitTxt + '</td>'
-      + '  <td class="plan-falta" style="line-height:1.5;">' + faltaTxt + '</td>'
-      + '  <td>'
-      +      badge
-      + (r.aplicavel && !res.temDireito
-          ? '<div class="plan-progresso"><div class="plan-progresso-fill ' + progClasse + '" style="width:' + prog + '%;"></div></div>'
-          : '')
-      + '  </td>'
-      + '</tr>';
-  });
-
-  html += ''
-    + '    </tbody>'
-    + '  </table>'
-    + '</div>';
-
-  // Oportunidades
-  if (oportunidades.length > 0) {
-    html += ''
-      + '<div class="plan-oport">'
-      + '  <div class="plan-th">💡 Oportunidades Inteligentes ('+ oportunidades.length + ')</div>';
-    oportunidades.forEach(function(op) {
-      html += ''
-        + '  <div class="plan-oport-item">'
-        + '    <div class="plan-oport-icon">' + op.icon + '</div>'
-        + '    <div style="flex:1;">'
-        + '      <div class="plan-oport-titulo">' + op.titulo + '</div>'
-        + '      <div class="plan-oport-desc">' + op.desc + '</div>'
-        + '    </div>'
-        + '  </div>';
-    });
-    html += '</div>';
+  if (!container) {
+    setTimeout(_injetarBotaoExport, 500);
+    return;
   }
 
-  // Rodapé com nota metodológica
-  html += ''
-    + '<div style="margin-top:16px;padding:12px 16px;background:rgba(61,127,255,.06);border-left:3px solid var(--blue);border-radius:6px;font-size:11px;color:var(--muted2);line-height:1.6;">'
-    + '  <strong style="color:var(--blue);">Nota:</strong> cálculos baseados apenas em dados do CNIS. Não inclui tempo especial (insalubridade/periculosidade), tempo rural não averbado, militar, ou público sem averbação. RMA e complementações serão calculadas em versões futuras. Sempre confirmar com simulação oficial no Meu INSS.'
-    + '</div>';
+  // Cria botão flutuante no canto da aba
+  var wrapper = document.createElement('div');
+  wrapper.style.cssText = 'margin:16px 0;display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;';
+  wrapper.innerHTML = ''
+    + '<button id="btn-export-plan" class="expplan-btn" onclick="window._apExportarPlanejamento()" '
+    +   'title="Gera JSON com dados do CNIS para abrir no A&P Planejamento">'
+    + '📊 Exportar p/ Planejamento'
+    + '</button>';
 
-  root.innerHTML = html;
-};
-
-// ─── INJEÇÃO DE ABA ─────────────────────────────────────────
-function _injetarAba() {
-  // 1. Botão da tab
-  var tabNav = document.querySelector('.tab-nav');
-  if (!tabNav) return;
-  if (document.querySelector('[data-tab="planejamento"]')) return;
-
-  var btnParecer = tabNav.querySelector('[data-tab="parecer"]');
-  if (!btnParecer) return;
-
-  var btnPlan = document.createElement('button');
-  btnPlan.className = 'tab-btn';
-  btnPlan.setAttribute('data-tab', 'planejamento');
-  btnPlan.innerHTML = '📊 Planejamento';
-  // Insere APÓS o botão Parecer
-  btnParecer.parentNode.insertBefore(btnPlan, btnParecer.nextSibling);
-
-  // 2. Panel
-  var panelParecer = document.getElementById('tab-parecer');
-  if (!panelParecer) return;
-  var panelPlan = document.createElement('div');
-  panelPlan.className = 'tab-panel';
-  panelPlan.id = 'tab-planejamento';
-  panelParecer.parentNode.insertBefore(panelPlan, panelParecer.nextSibling);
-
-  // 3. Listener — FAZ a troca de aba manualmente (o listener global não vê elementos criados depois)
-  btnPlan.addEventListener('click', function() {
-    // Remove .active de todos os botões e panels
-    document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
-    document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
-    // Ativa Planejamento
-    btnPlan.classList.add('active');
-    panelPlan.classList.add('active');
-    // Renderiza conteúdo
-    setTimeout(window.renderPlanejamento, 30);
-  });
+  container.appendChild(wrapper);
 }
+
+window._apExportarPlanejamento = _apExportarPlanejamento;
 
 document.addEventListener('DOMContentLoaded', function() {
-  setTimeout(_injetarAba, 800);
+  setTimeout(_injetarBotaoExport, 1500);
 });
 
-console.log('[A&P Planejamento] ✅ Módulo carregado');
+console.log('[A&P Export Planejamento] ✅ Módulo de export carregado');
 
 })();
 </script>
-
-<!-- ═══════════════════════════════════════════════════════════
-     A&P PLANEJAMENTO v2.0 — Expansão
-     
-     1. TODAS as aposentadorias (11 tipos com regras de transição)
-     2. Análise detalhada das contribuições (timeline + gaps)
-     3. Pendências identificadas (PSC, gaps, vínculos ativos)
-     4. Qualidade de segurado + benefícios não-programados
-     
-     Usa os mesmos dados do CNIS já extraídos.
-     NÃO substitui o módulo v1 — ESTENDE.
-     ═══════════════════════════════════════════════════════════ -->
-<style>
-/* Expansão de estilos */
-.plan-secao {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  margin-bottom: 20px;
-}
-.plan-secao-body { padding: 16px 18px; }
-
-/* Timeline de contribuições */
-.contrib-timeline {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(16px, 1fr));
-  gap: 2px;
-  margin: 12px 0;
-  padding: 8px;
-  background: rgba(0,0,0,.2);
-  border-radius: 8px;
-}
-.contrib-mes {
-  aspect-ratio: 1;
-  border-radius: 2px;
-  cursor: pointer;
-  transition: transform .1s ease;
-  position: relative;
-}
-.contrib-mes:hover { transform: scale(1.3); z-index: 2; box-shadow: 0 0 0 1px var(--gold); }
-.contrib-mes.valida      { background: rgba(34,201,122,.7); }
-.contrib-mes.invalida    { background: rgba(224,82,82,.6); }
-.contrib-mes.vazia       { background: rgba(255,255,255,.04); }
-.contrib-mes.concomitante { background: rgba(201,168,76,.7); }
-.contrib-mes.graca       { background: rgba(61,127,255,.3); }
-
-/* Legenda */
-.contrib-legenda {
-  display: flex; flex-wrap: wrap; gap: 12px;
-  font-size: 11px; color: var(--muted2);
-  margin-top: 10px;
-}
-.contrib-legenda-item { display: flex; align-items: center; gap: 5px; }
-.contrib-legenda-box {
-  width: 10px; height: 10px; border-radius: 2px;
-}
-
-/* Pendências */
-.pend-item {
-  display: flex; gap: 12px; padding: 10px 14px;
-  border-left: 3px solid transparent;
-  border-bottom: 1px solid var(--border);
-}
-.pend-item:last-child { border-bottom: none; }
-.pend-item.grave    { border-left-color: #e05252; background: rgba(224,82,82,.04); }
-.pend-item.atencao  { border-left-color: var(--amber); background: rgba(240,160,48,.03); }
-.pend-item.info     { border-left-color: var(--blue); background: rgba(61,127,255,.03); }
-.pend-item.resolvido { border-left-color: var(--green); opacity: .65; }
-.pend-icon { font-size: 18px; flex-shrink: 0; }
-.pend-titulo {
-  font-size: 13px; font-weight: 600; color: var(--text);
-  margin-bottom: 3px;
-}
-.pend-desc {
-  font-size: 11.5px; color: var(--muted2); line-height: 1.5;
-}
-.pend-acao {
-  font-size: 10.5px; color: var(--gold);
-  margin-top: 4px; font-family: var(--mono);
-}
-
-/* Qualidade de segurado */
-.qual-card {
-  padding: 14px 18px;
-  border-radius: 10px;
-  border: 1px solid transparent;
-  margin-bottom: 10px;
-}
-.qual-card.ativo    { background: rgba(34,201,122,.08); border-color: rgba(34,201,122,.3); }
-.qual-card.graca    { background: rgba(240,160,48,.08); border-color: rgba(240,160,48,.3); }
-.qual-card.perdeu   { background: rgba(224,82,82,.06); border-color: rgba(224,82,82,.25); }
-.qual-titulo {
-  font-family: var(--serif);
-  font-size: 16px;
-  color: var(--text);
-  margin-bottom: 4px;
-}
-.qual-desc { font-size: 12px; color: var(--muted2); }
-.qual-meta {
-  display: inline-block; margin-top: 8px;
-  padding: 3px 10px; border-radius: 10px;
-  font-family: var(--mono); font-size: 10px;
-  background: rgba(0,0,0,.25); color: var(--muted2);
-  letter-spacing: .1em;
-}
-
-/* Grid de benefícios não-programados */
-.benef-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-}
-.benef-card {
-  padding: 14px;
-  background: rgba(255,255,255,.02);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  transition: border-color .2s var(--ease);
-}
-.benef-card:hover { border-color: var(--gold); }
-.benef-nome {
-  font-size: 13px; font-weight: 600;
-  color: var(--text); margin-bottom: 4px;
-}
-.benef-sub {
-  font-size: 10.5px; color: var(--muted2); line-height: 1.4;
-}
-.benef-status {
-  display: inline-flex; align-items: center; gap: 4px;
-  margin-top: 8px; padding: 2px 8px;
-  border-radius: 10px; font-size: 10px;
-  font-family: var(--mono); font-weight: 700;
-}
-.benef-status.sim    { background: rgba(34,201,122,.15); color: var(--green); }
-.benef-status.talvez { background: rgba(240,160,48,.15); color: var(--amber); }
-.benef-status.nao    { background: rgba(224,82,82,.08); color: #e67070; }
-
-/* Filtro de mostrar todas */
-.toggle-todas {
-  display: flex; align-items: center; gap: 6px;
-  background: rgba(255,255,255,.03);
-  border: 1px solid var(--border);
-  padding: 6px 12px; border-radius: 20px;
-  cursor: pointer; font-size: 11px; color: var(--muted2);
-  font-family: var(--mono); letter-spacing: .1em;
-  transition: all .2s var(--ease);
-}
-.toggle-todas:hover { color: var(--gold); border-color: var(--gold); }
-.toggle-todas.ativo { background: rgba(201,168,76,.1); color: var(--gold); border-color: var(--gold); }
-</style>
-
+<!-- ═══════════════════════════════════════════════════════════════
+     A&P BACKEND INTEGRATION — cole este bloco ANTES de </body>
+     ═══════════════════════════════════════════════════════════════ -->
 <script>
-'use strict';
-// ═══════════════════════════════════════════════════════════
-// A&P PLANEJAMENTO — Expansão v2
-// ═══════════════════════════════════════════════════════════
-(function() {
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  A&P — Integração com Backend Local (http://localhost:5000)  ║
+// ╚══════════════════════════════════════════════════════════════╝
 
-// ──────────────────────────────────────────────────────────
-// UTILS (compartilhados — checam se v1 já definiu)
-// ──────────────────────────────────────────────────────────
-function _fmtData(d) {
-  if (!d || !(d instanceof Date) || isNaN(d)) return '—';
-  return String(d.getDate()).padStart(2,'0') + '/' +
-         String(d.getMonth()+1).padStart(2,'0') + '/' +
-         d.getFullYear();
-}
-function _fmtTempo(meses) {
-  if (!meses || meses < 0) return '0 anos, 0 meses';
-  var a = Math.floor(meses / 12);
-  var m = meses % 12;
-  return a + ' ano' + (a !== 1 ? 's' : '') + ', ' + m + ' mes' + (m !== 1 ? 'es' : '');
-}
-function _parseComp(s) {
-  // "MM/AAAA" → Date(AAAA, MM-1, 1)
-  if (!s) return null;
-  var m = String(s).match(/(\d{1,2})\/(\d{4})/);
-  if (!m) return null;
-  return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 1);
-}
+const AP_URL = 'http://localhost:5000';
+let _backendOnline = false;
 
-// ──────────────────────────────────────────────────────────
-// 1. REGRAS ADICIONAIS — mais aposentadorias
-// ──────────────────────────────────────────────────────────
-var REGRAS_EXTRAS = [
-  {
-    id: 'apos_hibrida',
-    nome: 'Aposentadoria Híbrida (Urbana + Rural)',
-    sub: 'Art. 48 §3º Lei 8.213/91',
-    aplicavel: function(d, ctx) {
-      // Tem que ter ALGUM tempo rural + ALGUM tempo urbano
-      return true; // sempre aplicável (o sistema decide se tem direito)
-    },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var idadeMinima = sexo === 'feminino' ? 62 : 65;
-      var carenciaMinima = 180;
-      var idadeAtual = ctx.idadeAtualMeses / 12;
+// ── BUG FIX: gk() estava definida 2x no código original.
+//    Esta versão unificada lê: memória → localStorage → embedded HTML ─────────
+window.gk = function(k) {
+  // 1. Memória da sessão (mais recente — preenchida pelo backend no load)
+  if (window._chavesMemoria && window._chavesMemoria[k]) return window._chavesMemoria[k];
+  // 2. localStorage
+  try { const v = localStorage.getItem(k); if (v) return v; } catch(e) {}
+  // 3. Embedded no HTML (permanente)
+  try {
+    const el = document.getElementById('ap-chaves-embedded');
+    const emb = el ? JSON.parse(el.textContent || '{}') : {};
+    return emb[k] || '';
+  } catch(e) { return ''; }
+};
 
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaCarencia = Math.max(0, carenciaMinima - ctx.carencia);
-      var temDireito = faltaIdade <= 0 && faltaCarencia <= 0;
+// ── sk() — salva no localStorage E no backend ────────────────────────────────
+const _skOriginal = window.sk;
+window.sk = function(k, v) {
+  // Salva local como antes
+  try { localStorage.setItem(k, v); } catch(e) {}
+  if (!window._chavesMemoria) window._chavesMemoria = {};
+  window._chavesMemoria[k] = v;
 
-      return {
-        temDireito: temDireito,
-        idadeMinima: idadeMinima,
-        carenciaMinima: carenciaMinima,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaCarencia: faltaCarencia,
-        progresso: temDireito ? 100 : Math.round((Math.min(idadeAtual/idadeMinima,1)*50) + (Math.min(ctx.carencia/carenciaMinima,1)*50)),
-        obs: 'Soma tempo rural + urbano. Rural com idade reduzida (60H/55M) se maioria rural.',
-      };
-    },
-  },
-  {
-    id: 'apos_professor',
-    nome: 'Aposentadoria de Professor',
-    sub: 'Art. 40 §5º CF + EC 103/2019',
-    aplicavel: function(d, ctx) {
-      // Só se for professor (detectável pelo tipo de vínculo/CBO)
-      if (!ctx.cnisOriginal || !ctx.cnisOriginal._vinculos) return false;
-      return ctx.cnisOriginal._vinculos.some(function(v) {
-        return /profess|magist[eé]rio|educa/i.test((v.empresa||'') + ' ' + (v.tipo||''));
-      });
-    },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      // Regra EC 103: 57M/60H idade + 25M/30H tempo + exclusivamente magistério
-      var idadeMinima = sexo === 'feminino' ? 57 : 60;
-      var tempoMinimo = sexo === 'feminino' ? 300 : 360;
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-      var temDireito = faltaIdade <= 0 && faltaTempo <= 0;
-
-      return {
-        temDireito: temDireito,
-        idadeMinima: idadeMinima,
-        tempoMinimo: tempoMinimo,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo,1) * 100),
-        obs: 'Tempo deve ser exclusivamente em magistério.',
-      };
-    },
-  },
-  {
-    id: 'apos_especial',
-    nome: 'Aposentadoria Especial',
-    sub: 'EC 103/2019 Art. 19 §1º',
-    aplicavel: function(d, ctx) {
-      // Sempre aplicável mas exige PPP/LTCAT para confirmar
-      return true;
-    },
-    calcular: function(ctx) {
-      // Regra: soma idade + tempo especial ≥ 66 (15 anos especial) / 76 (20) / 86 (25)
-      // MVP: assume grau mais comum = 25 anos
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var tempoAtual = ctx.tempoContribMeses / 12;
-      var somaAtual = idadeAtual + tempoAtual;
-
-      var tempoMinimo25 = 300; // 25 anos para grau normal
-      var somaMinima25  = 86;
-
-      var faltaTempo = Math.max(0, tempoMinimo25 - ctx.tempoContribMeses);
-      var faltaSoma  = Math.max(0, somaMinima25 - somaAtual);
-      var temDireito = faltaTempo <= 0 && faltaSoma <= 0;
-
-      return {
-        temDireito: temDireito,
-        tempoMinimo: tempoMinimo25,
-        tempoContrib: ctx.tempoContribMeses,
-        somaMinima: somaMinima25,
-        somaAtual: Math.floor(somaAtual),
-        faltaTempo: faltaTempo,
-        faltaSoma: Math.ceil(faltaSoma),
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo25,1) * 100),
-        obs: 'Requer PPP/LTCAT comprovando exposição agentes nocivos. Regras: 15 anos (grau máx), 20 anos, 25 anos (comum).',
-      };
-    },
-  },
-  {
-    id: 'apos_pcd_tempo',
-    nome: 'Aposentadoria por Tempo — Pessoa com Deficiência',
-    sub: 'LC 142/2013',
-    aplicavel: function(d, ctx) { return true; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      // Deficiência GRAVE: 20H/25M; MODERADA: 25H/29M; LEVE: 28H/33M
-      var tempoMinimo = sexo === 'feminino' ? 300 : 360; // leve default
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-      var temDireito = faltaTempo <= 0;
-
-      return {
-        temDireito: temDireito,
-        tempoMinimo: tempoMinimo,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo,1) * 100),
-        obs: 'Requer perícia do INSS para graduar deficiência (grave/moderada/leve). Tempo varia por grau.',
-      };
-    },
-  },
-  {
-    id: 'apos_pcd_idade',
-    nome: 'Aposentadoria por Idade — PCD',
-    sub: 'LC 142/2013 Art. 3º III',
-    aplicavel: function(d, ctx) { return true; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var idadeMinima = sexo === 'feminino' ? 55 : 60;
-      var carenciaMinima = 180;
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaCarencia = Math.max(0, carenciaMinima - ctx.carencia);
-      var temDireito = faltaIdade <= 0 && faltaCarencia <= 0;
-
-      return {
-        temDireito: temDireito,
-        idadeMinima: idadeMinima,
-        carenciaMinima: carenciaMinima,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaCarencia: faltaCarencia,
-        progresso: temDireito ? 100 : Math.round((Math.min(idadeAtual/idadeMinima,1)*50) + (Math.min(ctx.carencia/carenciaMinima,1)*50)),
-        obs: 'Requer comprovação de deficiência em qualquer grau por pelo menos 15 anos.',
-      };
-    },
-  },
-  {
-    id: 'transicao_idade_progressiva',
-    nome: 'Transição — Idade Progressiva',
-    sub: 'EC 103/2019 Art. 18',
-    aplicavel: function(d, ctx) { return ctx.temContribAnterior2019; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var tempoMinimo = sexo === 'feminino' ? 360 : 420; // 30/35 anos
-      // Idade inicia em 56M/61H (2019) e sobe 0,5 por ano até 62M/65H
-      var anosDesde2019 = new Date().getFullYear() - 2019;
-      var idadeInicio = sexo === 'feminino' ? 56 : 61;
-      var idadeMaxima = sexo === 'feminino' ? 62 : 65;
-      var idadeAtualRegra = Math.min(idadeMaxima, idadeInicio + (anosDesde2019 * 0.5));
-
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var faltaIdade = Math.max(0, idadeAtualRegra - idadeAtual);
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-      var temDireito = faltaIdade <= 0 && faltaTempo <= 0;
-
-      return {
-        temDireito: temDireito,
-        idadeMinima: idadeAtualRegra,
-        tempoMinimo: tempoMinimo,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo,1) * 100),
-        obs: 'Idade mínima cresce 0,5 ano/ano até atingir 62M/65H em 2031.',
-      };
-    },
-  },
-  {
-    id: 'pedagio_100',
-    nome: 'Pedágio 100%',
-    sub: 'EC 103/2019 Art. 20',
-    aplicavel: function(d, ctx) { return ctx.temContribAnterior2019; },
-    calcular: function(ctx) {
-      var sexo = ctx.sexo;
-      var idadeMinima = sexo === 'feminino' ? 57 : 60;
-      var tempoMinAntigo = sexo === 'feminino' ? 360 : 420;
-      var faltavaEm2019 = Math.max(0, tempoMinAntigo - (ctx.tempoContrib2019 || 0));
-      var pedagio = faltavaEm2019 * 2; // 100% do que faltava
-      var tempoMinimo = (ctx.tempoContrib2019 || 0) + pedagio;
-
-      var idadeAtual = ctx.idadeAtualMeses / 12;
-      var faltaIdade = Math.max(0, idadeMinima - idadeAtual);
-      var faltaTempo = Math.max(0, tempoMinimo - ctx.tempoContribMeses);
-      var temDireito = faltaIdade <= 0 && faltaTempo <= 0;
-
-      return {
-        temDireito: temDireito,
-        idadeMinima: idadeMinima,
-        tempoMinimo: tempoMinimo,
-        tempoContrib: ctx.tempoContribMeses,
-        faltaIdade: Math.ceil(faltaIdade * 12),
-        faltaTempo: faltaTempo,
-        progresso: temDireito ? 100 : Math.round(Math.min(ctx.tempoContribMeses/tempoMinimo,1) * 100),
-        obs: 'Pedágio de 100% do tempo que faltava em 13/11/2019. Valor integral sem fator.',
-      };
-    },
-  },
-];
-
-// ──────────────────────────────────────────────────────────
-// 2. QUALIDADE DE SEGURADO
-// ──────────────────────────────────────────────────────────
-function _calcularQualidadeSegurado(ctx) {
-  var cnis = ctx.cnisOriginal;
-  if (!cnis || !cnis._vinculos) {
-    return { status: 'indefinido', desc: 'Sem dados suficientes para determinar qualidade de segurado.' };
-  }
-
-  var hoje = new Date();
-  var ultimaContrib = cnis._ultimaContribuicaoValida || cnis._ultimoVinculo;
-  var ultimaData = _parseComp(ultimaContrib);
-
-  // Verifica se tem vínculo aberto (fim vazio ou "EM ABERTO")
-  var temVinculoAberto = (cnis._vinculos || []).some(function(v) {
-    return !v.fim || /aberto|atual|vigente/i.test(v.fim);
-  });
-
-  if (temVinculoAberto) {
-    return {
-      status: 'ativo',
-      desc: 'Possui vínculo empregatício ATIVO. Qualidade de segurado preservada automaticamente.',
-      meta: 'VÍNCULO VIGENTE',
+  // Sincroniza com o backend se for chave de API
+  if (_backendOnline && k.startsWith('ap-') && k.endsWith('-key') && v && v.length > 8) {
+    const provedorMap = {
+      'ap-groq-key': 'groq',
+      'ap-or-key':   'openrouter',
+      'ap-tg-key':   'together',
+      'ap-cb-key':   'cerebras',
+      'ap-sn-key':   'sambanova',
     };
-  }
-
-  if (!ultimaData) {
-    return { status: 'indefinido', desc: 'Não foi possível identificar a última contribuição.' };
-  }
-
-  // Calcula meses desde última contribuição
-  var mesesDesde = (hoje.getFullYear() - ultimaData.getFullYear()) * 12
-                 + (hoje.getMonth() - ultimaData.getMonth());
-
-  // Período de graça:
-  // - Regra geral: 12 meses
-  // - +12 meses se tiver >120 contribuições: 24 meses
-  // - +12 se comprovar desemprego: 36 meses
-  var totalContrib = cnis._totalContribuicoesValidas || cnis._totalContribuicoes || 0;
-  var gracaBase = 12;
-  if (totalContrib >= 120) gracaBase = 24;
-  var gracaMaxComDesemprego = gracaBase + 12; // 24 ou 36
-
-  if (mesesDesde <= gracaBase) {
-    var restam = gracaBase - mesesDesde;
-    return {
-      status: 'graca',
-      desc: 'Em período de graça. Última contribuição: ' + _fmtData(ultimaData) + '. Restam ' + restam + ' meses na graça normal' + (gracaBase === 24 ? ' (24 meses por ter >120 contribuições)' : '') + '.',
-      meta: 'RESTAM ' + restam + ' MESES',
-    };
-  }
-
-  if (mesesDesde <= gracaMaxComDesemprego) {
-    var restam2 = gracaMaxComDesemprego - mesesDesde;
-    return {
-      status: 'graca',
-      desc: 'Graça prorrogada possível (requer comprovação de desemprego no Ministério do Trabalho). Última contribuição: ' + _fmtData(ultimaData) + '. Máximo ' + restam2 + ' meses se comprovado.',
-      meta: 'GRAÇA ESTENDIDA — COMPROVAR DESEMPREGO',
-    };
-  }
-
-  return {
-    status: 'perdeu',
-    desc: 'Qualidade de segurado PERDIDA. Última contribuição: ' + _fmtData(ultimaData) + ' (' + mesesDesde + ' meses atrás). Para recuperar direitos: contribuir 6 meses (metade da carência) para benefícios por incapacidade.',
-    meta: mesesDesde + ' MESES SEM CONTRIBUIR',
-  };
-}
-
-// ──────────────────────────────────────────────────────────
-// 3. ANÁLISE DE CONTRIBUIÇÕES
-// ──────────────────────────────────────────────────────────
-function _analisarContribuicoes(ctx) {
-  var cnis = ctx.cnisOriginal;
-  if (!cnis || !cnis._contribuicoesDetalhadas || !cnis._contribuicoesDetalhadas.length) {
-    return null;
-  }
-
-  var contribs = cnis._contribuicoesDetalhadas;
-
-  // Ordena por data
-  contribs = contribs.slice().sort(function(a, b) {
-    var da = _parseComp(a.comp), db = _parseComp(b.comp);
-    return (da && db) ? da - db : 0;
-  });
-
-  var primeira = _parseComp(contribs[0].comp);
-  var ultima   = _parseComp(contribs[contribs.length - 1].comp);
-  if (!primeira || !ultima) return null;
-
-  // Monta mapa de contribuições por mês
-  var mapa = {};
-  contribs.forEach(function(c) {
-    var d = _parseComp(c.comp);
-    if (!d) return;
-    var key = d.getFullYear() * 12 + d.getMonth();
-    if (!mapa[key]) mapa[key] = { data: d, contribs: [] };
-    mapa[key].contribs.push(c);
-  });
-
-  // Gera timeline do primeiro ao último mês
-  var inicio = primeira.getFullYear() * 12 + primeira.getMonth();
-  var fim    = ultima.getFullYear() * 12 + ultima.getMonth();
-  var timeline = [];
-  var gaps = [];
-  var gapAtual = null;
-
-  for (var i = inicio; i <= fim; i++) {
-    var d = new Date(Math.floor(i / 12), i % 12, 1);
-    var mes = mapa[i];
-    var status;
-    if (!mes) {
-      status = 'vazia';
-      if (!gapAtual) gapAtual = { inicio: d, fim: d, meses: 1 };
-      else { gapAtual.fim = d; gapAtual.meses++; }
-    } else {
-      if (gapAtual) {
-        if (gapAtual.meses >= 3) gaps.push(gapAtual);
-        gapAtual = null;
-      }
-      // Tem contribuição — vale?
-      var todasInvalidas = mes.contribs.every(function(c) {
-        return (c.indicadores || []).some(function(i) { return /PSC-MEN-SM/.test(i); });
-      });
-      if (todasInvalidas) status = 'invalida';
-      else if (mes.contribs.length > 1) status = 'concomitante';
-      else status = 'valida';
+    const provedor = provedorMap[k];
+    if (provedor) {
+      fetch(AP_URL + '/api/chaves', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provedor, chave: v })
+      }).catch(() => {}); // silencioso — não bloqueia o usuário
     }
-    timeline.push({
-      mes: d,
-      status: status,
-      contribs: mes ? mes.contribs : [],
-    });
-  }
-  if (gapAtual && gapAtual.meses >= 3) gaps.push(gapAtual);
-
-  return {
-    timeline: timeline,
-    gaps: gaps,
-    primeiraContrib: primeira,
-    ultimaContrib: ultima,
-    totalMeses: fim - inicio + 1,
-    mesesComContrib: Object.keys(mapa).length,
-    mesesSemContrib: (fim - inicio + 1) - Object.keys(mapa).length,
-  };
-}
-
-// ──────────────────────────────────────────────────────────
-// 4. PENDÊNCIAS
-// ──────────────────────────────────────────────────────────
-function _detectarPendencias(ctx, analise) {
-  var pends = [];
-  var cnis = ctx.cnisOriginal;
-  if (!cnis) return pends;
-
-  // 1. Contribuições inválidas (PSC-MEN-SM)
-  if (cnis._contribuicoesInvalidas > 0) {
-    pends.push({
-      nivel: 'grave',
-      icon: '⚠️',
-      titulo: cnis._contribuicoesInvalidas + ' contribuições ABAIXO do salário mínimo',
-      desc: 'Competências marcadas com PSC-MEN-SM-EC103 não contam para carência. EC 103/2019 §14 do Art. 29.',
-      acao: 'AÇÃO: complementar contribuições afetadas ou deduzir da carência.',
-    });
-  }
-
-  // 2. Gaps grandes (>12 meses)
-  if (analise && analise.gaps) {
-    analise.gaps.filter(function(g) { return g.meses >= 12; }).forEach(function(g) {
-      pends.push({
-        nivel: 'atencao',
-        icon: '📉',
-        titulo: 'Período sem contribuição: ' + g.meses + ' meses',
-        desc: 'De ' + _fmtData(g.inicio) + ' a ' + _fmtData(g.fim) + ' — sem registros. Verificar se houve atividade rural, informal ou se há documentos comprobatórios não incluídos.',
-        acao: 'AÇÃO: checar se há documentos rurais (CAEPF, RGP, DAP) para esse período.',
-      });
-    });
-  }
-
-  // 3. Vínculos sem fim (ainda ativos?)
-  var vinculosAtivos = (cnis._vinculos || []).filter(function(v) {
-    return !v.fim || /aberto|atual|vigente/i.test(v.fim);
-  });
-  if (vinculosAtivos.length > 0) {
-    vinculosAtivos.forEach(function(v) {
-      pends.push({
-        nivel: 'info',
-        icon: '🔵',
-        titulo: 'Vínculo em aberto: ' + (v.empresa || 'empresa não identificada').substring(0, 50),
-        desc: 'Iniciado em ' + (v.inicio || '?') + '. Ainda consta como ativo no CNIS — confirmar se cliente continua trabalhando.',
-        acao: 'AÇÃO: confirmar com o cliente status do vínculo atual.',
-      });
-    });
-  }
-
-  // 4. MEI com alíquota incompleta
-  var temIREC = false;
-  (cnis._contribuicoesDetalhadas || []).forEach(function(c) {
-    if ((c.indicadores || []).some(function(i) { return /IREC-MEI/.test(i); })) temIREC = true;
-  });
-  if (temIREC) {
-    pends.push({
-      nivel: 'info',
-      icon: '💼',
-      titulo: 'Contribuições MEI com alíquota reduzida (5%)',
-      desc: 'MEI contribui apenas 5% do SM — só dá direito a aposentadoria por idade. Para outras aposentadorias, é necessário complementar para 20%.',
-      acao: 'AÇÃO: avaliar complementação (15% adicional) para acessar todas as regras.',
-    });
-  }
-
-  // 5. Última contribuição muito antiga
-  if (cnis._mesesDesdeUltimo && cnis._mesesDesdeUltimo > 24) {
-    pends.push({
-      nivel: 'atencao',
-      icon: '⏰',
-      titulo: 'Sem contribuir há ' + cnis._mesesDesdeUltimo + ' meses',
-      desc: 'Qualidade de segurado muito provavelmente perdida. Para benefícios por incapacidade, requer 6 meses de contribuição após filiação novamente.',
-      acao: 'AÇÃO: voltar a contribuir ou regularizar situação antes de qualquer pedido.',
-    });
-  }
-
-  // 6. Nenhuma pendência
-  if (pends.length === 0) {
-    pends.push({
-      nivel: 'resolvido',
-      icon: '✅',
-      titulo: 'Sem pendências críticas identificadas',
-      desc: 'CNIS aparenta estar regular. Contribuições consistentes, sem períodos marcados como inválidos.',
-      acao: '',
-    });
-  }
-
-  return pends;
-}
-
-// ──────────────────────────────────────────────────────────
-// 5. BENEFÍCIOS NÃO-PROGRAMADOS (qualidade + tempo)
-// ──────────────────────────────────────────────────────────
-function _analisarNaoProgramados(ctx, qualidade) {
-  var benefs = [];
-  var temQualidade = qualidade.status === 'ativo' || qualidade.status === 'graca';
-  var idadeAnos = ctx.idadeAtualMeses / 12;
-  var carencia = ctx.carencia;
-
-  benefs.push({
-    nome: '🤕 Auxílio por Incapacidade Temporária',
-    sub: 'Art. 59 Lei 8.213/91',
-    regra: 'Carência: 12 meses + qualidade de segurado',
-    temDireito: temQualidade && carencia >= 12,
-    status: temQualidade && carencia >= 12 ? 'sim' : (!temQualidade ? 'nao' : 'talvez'),
-    motivo: !temQualidade ? 'Sem qualidade de segurado' : (carencia < 12 ? 'Carência insuficiente (' + carencia + '/12)' : 'Apto'),
-  });
-
-  benefs.push({
-    nome: '♿ Aposentadoria por Incapacidade Permanente',
-    sub: 'Art. 42 Lei 8.213/91',
-    regra: 'Carência: 12 meses (dispensada para acidente) + qualidade',
-    temDireito: temQualidade && carencia >= 12,
-    status: temQualidade && carencia >= 12 ? 'sim' : (!temQualidade ? 'nao' : 'talvez'),
-    motivo: !temQualidade ? 'Sem qualidade de segurado' : (carencia < 12 ? 'Carência insuficiente' : 'Requer perícia'),
-  });
-
-  if (ctx.sexo === 'feminino') {
-    var temAtividadeRural = ctx.tipoAtividade === 'RURAL' || ctx._rural;
-    benefs.push({
-      nome: '🤰 Salário-Maternidade',
-      sub: 'Art. 71 Lei 8.213/91',
-      regra: temAtividadeRural ? 'Rural: sem carência, comprovar atividade' : 'Urbana: 10 contribuições (CI/facultativa) — empregada não tem carência',
-      temDireito: temQualidade,
-      status: temQualidade ? 'sim' : 'nao',
-      motivo: !temQualidade ? 'Sem qualidade' : 'Apto (verificar tipo de segurada)',
-    });
-  }
-
-  benefs.push({
-    nome: '💔 Pensão por Morte (se instituidor for segurado)',
-    sub: 'Art. 74 Lei 8.213/91',
-    regra: 'Sem carência — basta qualidade do instituidor no momento do óbito',
-    temDireito: temQualidade,
-    status: 'sim',
-    motivo: 'Benefício vai para dependentes, não para o titular',
-  });
-
-  if (idadeAnos >= 65) {
-    benefs.push({
-      nome: '👵 BPC/LOAS — Idoso',
-      sub: 'Art. 20 Lei 8.742/93',
-      regra: 'Idade ≥ 65 anos + renda per capita < ¼ SM',
-      temDireito: true,
-      status: 'talvez',
-      motivo: 'Requer comprovação de miserabilidade via CadÚnico',
-    });
-  }
-  benefs.push({
-    nome: '♿ BPC/LOAS — Deficiência',
-    sub: 'Art. 20 §2º Lei 8.742/93',
-    regra: 'Qualquer idade + deficiência ≥ 2 anos + renda ¼ SM',
-    temDireito: true,
-    status: 'talvez',
-    motivo: 'Requer perícia + CadÚnico atualizado',
-  });
-
-  return benefs;
-}
-
-// ──────────────────────────────────────────────────────────
-// 6. RENDERIZAÇÃO ESTENDIDA — adiciona seções ao v1
-// ──────────────────────────────────────────────────────────
-var _renderOrig = window.renderPlanejamento;
-
-window.renderPlanejamento = function() {
-  // Executa o render v1 primeiro
-  if (typeof _renderOrig === 'function') _renderOrig();
-
-  var root = document.getElementById('tab-planejamento');
-  if (!root) return;
-
-  // Se v1 mostrou empty state, não adiciona nada
-  if (root.querySelector('.plan-empty')) return;
-
-  // Reconstrói contexto
-  var dados = typeof dadosExtraidos !== 'undefined' ? dadosExtraidos : {};
-  var todos = typeof _todosDocumentosDados !== 'undefined' ? _todosDocumentosDados : [];
-  var cnis = (todos || []).find(function(d) {
-    return d && (d._tipoDetectado === 'cnis' || /cnis|extrato/i.test(d.tipoDocumento || ''));
-  }) || dados;
-
-  var ctx = {
-    nomeCliente: dados.nomeCliente || cnis.nomeCliente,
-    cnisOriginal: cnis,
-    sexo: (function() {
-      var n = (dados.nomeCliente || '').split(' ')[0];
-      return /a$/i.test(n) ? 'feminino' : 'masculino';
-    })(),
-    idadeAtualMeses: (function() {
-      var d = dados.dataNascimento || cnis.dataNascimento;
-      if (!d) return 0;
-      var m = String(d).match(/(\d{2})\/(\d{2})\/(\d{4})/);
-      if (!m) return 0;
-      var nasc = new Date(parseInt(m[3]), parseInt(m[2])-1, parseInt(m[1]));
-      var hoje = new Date();
-      return (hoje.getFullYear() - nasc.getFullYear()) * 12 + (hoje.getMonth() - nasc.getMonth());
-    })(),
-    tempoContribMeses: cnis._totalContribuicoesValidas || cnis._totalContribuicoes || 0,
-    carencia: cnis._totalContribuicoesValidas || 0,
-    tipoAtividade: cnis.tipoAtividade || dados.tipoAtividade,
-    temContribAnterior2019: false,
-    tempoContrib2019: 0,
-  };
-
-  // Calcula tempo pré-2019
-  if (cnis._contribuicoesDetalhadas) {
-    var reforma = new Date(2019, 10, 13);
-    cnis._contribuicoesDetalhadas.forEach(function(c) {
-      var d = _parseComp(c.comp);
-      if (d && d < reforma) {
-        ctx.temContribAnterior2019 = true;
-        ctx.tempoContrib2019++;
-      }
-    });
-  }
-
-  // ═══ SEÇÃO: TODAS AS APOSENTADORIAS ═══
-  var extras = REGRAS_EXTRAS.map(function(regra) {
-    var aplic = regra.aplicavel(dados, ctx);
-    return {
-      id: regra.id,
-      nome: regra.nome,
-      sub: regra.sub,
-      aplicavel: aplic,
-      resultado: aplic ? regra.calcular(ctx) : { temDireito: false, naoAplicavel: true },
-    };
-  });
-
-  var htmlExtras = ''
-    + '<div class="plan-secao">'
-    + '  <div class="plan-th" style="display:flex;justify-content:space-between;align-items:center;">'
-    + '    <span>🏛️ Todas as Aposentadorias — Comparativo Completo</span>'
-    + '  </div>'
-    + '  <table>'
-    + '    <thead><tr>'
-    + '      <th style="width:30%;">Benefício</th>'
-    + '      <th style="width:22%;">Requisitos</th>'
-    + '      <th style="width:22%;">Situação Atual</th>'
-    + '      <th style="width:13%;">Falta</th>'
-    + '      <th style="width:13%;">Status</th>'
-    + '    </tr></thead>'
-    + '    <tbody>';
-
-  extras.forEach(function(r) {
-    var res = r.resultado;
-    var reqTxt = '';
-    if (res.idadeMinima)    reqTxt += '<div>Idade: ' + (typeof res.idadeMinima === 'number' ? res.idadeMinima.toFixed(1).replace(/\.0$/,'') : res.idadeMinima) + ' anos</div>';
-    if (res.tempoMinimo)    reqTxt += '<div>Tempo: ' + _fmtTempo(res.tempoMinimo) + '</div>';
-    if (res.carenciaMinima) reqTxt += '<div>Carência: ' + res.carenciaMinima + '</div>';
-    if (res.somaMinima)     reqTxt += '<div>Idade+Tempo: ' + res.somaMinima + '</div>';
-    if (!reqTxt) reqTxt = '—';
-
-    var sitTxt = '';
-    if (res.idadeMinima)    sitTxt += '<div>Idade: ' + Math.floor(ctx.idadeAtualMeses/12) + ' anos</div>';
-    if (res.tempoMinimo)    sitTxt += '<div>Tempo: ' + _fmtTempo(ctx.tempoContribMeses) + '</div>';
-    if (res.carenciaMinima) sitTxt += '<div>Carência: ' + ctx.carencia + '</div>';
-    if (res.somaAtual)      sitTxt += '<div>Soma: ' + res.somaAtual + '</div>';
-    if (!sitTxt) sitTxt = '—';
-
-    var faltaTxt = '';
-    if (res.faltaIdade > 0)    faltaTxt += '<div>' + Math.ceil(res.faltaIdade/12) + ' anos idade</div>';
-    if (res.faltaTempo > 0)    faltaTxt += '<div>' + _fmtTempo(res.faltaTempo) + '</div>';
-    if (res.faltaCarencia > 0) faltaTxt += '<div>' + res.faltaCarencia + ' contribs</div>';
-    if (res.faltaSoma > 0)     faltaTxt += '<div>' + res.faltaSoma + ' pontos</div>';
-    if (!faltaTxt && res.temDireito) faltaTxt = '<span style="color:var(--green);">—</span>';
-    if (!faltaTxt) faltaTxt = '<span style="color:var(--muted);">—</span>';
-
-    var prog = res.progresso || 0;
-    var progClasse = prog >= 90 ? 'alto' : prog >= 50 ? 'medio' : 'baixo';
-    var badge;
-    if (!r.aplicavel)             badge = '<span class="plan-badge sem-direito">N/A</span>';
-    else if (res.temDireito)      badge = '<span class="plan-badge direito">✓ DIREITO</span>';
-    else if (prog >= 80)          badge = '<span class="plan-badge quase">Próximo</span>';
-    else                          badge = '<span class="plan-badge sem-direito">Longe</span>';
-
-    htmlExtras += '<tr>'
-      + '<td><div class="plan-b-nome">' + r.nome + '</div>'
-      +   '<div class="plan-b-sub">' + r.sub + '</div>'
-      +   (res.obs ? '<div style="font-size:10px;color:var(--muted);margin-top:4px;font-style:italic;">' + res.obs + '</div>' : '')
-      + '</td>'
-      + '<td style="font-size:11px;line-height:1.5;">' + reqTxt + '</td>'
-      + '<td style="font-size:11px;line-height:1.5;">' + sitTxt + '</td>'
-      + '<td class="plan-falta" style="line-height:1.5;">' + faltaTxt + '</td>'
-      + '<td>' + badge
-      +   (r.aplicavel && !res.temDireito
-            ? '<div class="plan-progresso"><div class="plan-progresso-fill ' + progClasse + '" style="width:' + prog + '%;"></div></div>'
-            : '')
-      + '</td>'
-      + '</tr>';
-  });
-
-  htmlExtras += '</tbody></table></div>';
-
-  // ═══ SEÇÃO: QUALIDADE DE SEGURADO ═══
-  var qual = _calcularQualidadeSegurado(ctx);
-  var htmlQual = ''
-    + '<div class="plan-secao">'
-    + '  <div class="plan-th">🛡️ Qualidade de Segurado</div>'
-    + '  <div class="plan-secao-body">'
-    + '    <div class="qual-card ' + qual.status + '">'
-    + '      <div class="qual-titulo">'
-    +        (qual.status === 'ativo' ? '✅ Segurado ATIVO' :
-              qual.status === 'graca' ? '⏳ Período de Graça' :
-              qual.status === 'perdeu' ? '❌ Qualidade PERDIDA' :
-              '❓ Indefinido') + '</div>'
-    + '      <div class="qual-desc">' + qual.desc + '</div>'
-    + (qual.meta ? '<div class="qual-meta">' + qual.meta + '</div>' : '')
-    + '    </div>'
-    + '  </div>'
-    + '</div>';
-
-  // ═══ SEÇÃO: BENEFÍCIOS NÃO-PROGRAMADOS ═══
-  var naoProg = _analisarNaoProgramados(ctx, qual);
-  var htmlNaoProg = ''
-    + '<div class="plan-secao">'
-    + '  <div class="plan-th">🩺 Benefícios por Incapacidade e Outros</div>'
-    + '  <div class="plan-secao-body">'
-    + '    <div class="benef-grid">';
-  naoProg.forEach(function(b) {
-    htmlNaoProg += ''
-      + '<div class="benef-card">'
-      + '  <div class="benef-nome">' + b.nome + '</div>'
-      + '  <div class="benef-sub">' + b.sub + '</div>'
-      + '  <div class="benef-sub" style="margin-top:6px;color:var(--text);">' + b.regra + '</div>'
-      + '  <span class="benef-status ' + b.status + '">'
-      +    (b.status === 'sim' ? '✓ ELEGÍVEL' : b.status === 'talvez' ? '~ VERIFICAR' : '✗ NÃO ELEGÍVEL')
-      + '  </span>'
-      + '  <div class="benef-sub" style="margin-top:6px;font-style:italic;">' + b.motivo + '</div>'
-      + '</div>';
-  });
-  htmlNaoProg += '</div></div></div>';
-
-  // ═══ SEÇÃO: ANÁLISE DE CONTRIBUIÇÕES ═══
-  var analise = _analisarContribuicoes(ctx);
-  var htmlAnalise = '';
-  if (analise) {
-    htmlAnalise = ''
-      + '<div class="plan-secao">'
-      + '  <div class="plan-th">📊 Apontamento das Contribuições</div>'
-      + '  <div class="plan-secao-body">'
-      + '    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;font-size:12px;">'
-      + '      <div><div class="plan-seg-label">Primeira contribuição</div><div style="font-weight:600;color:var(--text);">' + _fmtData(analise.primeiraContrib) + '</div></div>'
-      + '      <div><div class="plan-seg-label">Última contribuição</div><div style="font-weight:600;color:var(--text);">' + _fmtData(analise.ultimaContrib) + '</div></div>'
-      + '      <div><div class="plan-seg-label">Total de meses</div><div style="font-weight:600;color:var(--text);">' + analise.totalMeses + '</div></div>'
-      + '      <div><div class="plan-seg-label">Com contribuição</div><div style="font-weight:600;color:var(--green);">' + analise.mesesComContrib + '</div></div>'
-      + '      <div><div class="plan-seg-label">Sem contribuição</div><div style="font-weight:600;color:#e67070;">' + analise.mesesSemContrib + '</div></div>'
-      + '      <div><div class="plan-seg-label">Gaps (≥3 meses)</div><div style="font-weight:600;color:var(--amber);">' + analise.gaps.length + '</div></div>'
-      + '    </div>'
-      + '    <div class="contrib-timeline">';
-    analise.timeline.forEach(function(m) {
-      var tooltip = _fmtData(m.mes) + ' — ' + (
-        m.status === 'valida' ? 'contribuição válida' :
-        m.status === 'invalida' ? 'contribuição INVÁLIDA (abaixo do SM)' :
-        m.status === 'concomitante' ? 'múltiplas contribuições' :
-        'sem contribuição'
-      );
-      htmlAnalise += '<div class="contrib-mes ' + m.status + '" title="' + tooltip + '"></div>';
-    });
-    htmlAnalise += '</div>'
-      + '    <div class="contrib-legenda">'
-      + '      <div class="contrib-legenda-item"><div class="contrib-legenda-box" style="background:rgba(34,201,122,.7);"></div>Válida</div>'
-      + '      <div class="contrib-legenda-item"><div class="contrib-legenda-box" style="background:rgba(224,82,82,.6);"></div>Inválida (PSC)</div>'
-      + '      <div class="contrib-legenda-item"><div class="contrib-legenda-box" style="background:rgba(201,168,76,.7);"></div>Concomitante</div>'
-      + '      <div class="contrib-legenda-item"><div class="contrib-legenda-box" style="background:rgba(255,255,255,.04);"></div>Sem contribuição</div>'
-      + '    </div>'
-      + '  </div>'
-      + '</div>';
-  }
-
-  // ═══ SEÇÃO: PENDÊNCIAS ═══
-  var pends = _detectarPendencias(ctx, analise);
-  var htmlPend = ''
-    + '<div class="plan-secao">'
-    + '  <div class="plan-th">🔍 Pendências Identificadas (' + pends.filter(function(p){return p.nivel!=='resolvido';}).length + ')</div>';
-  pends.forEach(function(p) {
-    htmlPend += ''
-      + '<div class="pend-item ' + p.nivel + '">'
-      + '  <div class="pend-icon">' + p.icon + '</div>'
-      + '  <div style="flex:1;">'
-      + '    <div class="pend-titulo">' + p.titulo + '</div>'
-      + '    <div class="pend-desc">' + p.desc + '</div>'
-      + (p.acao ? '<div class="pend-acao">' + p.acao + '</div>' : '')
-      + '  </div>'
-      + '</div>';
-  });
-  htmlPend += '</div>';
-
-  // ═══ INSERE TUDO ANTES DA NOTA METODOLÓGICA ═══
-  var nota = root.querySelector('[style*="strong style=\\"color:var(--blue);\\">Nota"]')
-          || root.querySelector('div[style*="border-left:3px solid var(--blue)"]');
-  // Busca mais simples: último filho do root
-  var ultimo = root.lastElementChild;
-
-  var container = document.createElement('div');
-  container.innerHTML = htmlQual + htmlAnalise + htmlPend + htmlExtras + htmlNaoProg;
-
-  // Insere ANTES da nota metodológica
-  if (ultimo && ultimo.textContent.includes('Nota:')) {
-    root.insertBefore(container, ultimo);
-    // move os filhos do container para root, mantendo ordem
-    while (container.firstChild) {
-      root.insertBefore(container.firstChild, ultimo);
-    }
-  } else {
-    root.appendChild(container);
   }
 };
 
-console.log('[A&P Planejamento v2] ✅ Expansão carregada — 7 aposentadorias + qualidade + contribuições + pendências');
+// ── Verificar backend e sincronizar chaves ────────────────────────────────────
+async function iniciarBackend() {
+  try {
+    const r = await fetch(AP_URL + '/ping', { signal: AbortSignal.timeout(2500) });
+    if (!r.ok) return;
+    _backendOnline = true;
+    console.log('[A&P] Backend online ✓');
+    atualizarIndicadorBackend(true);
+    await sincronizarChavesDoBackend();
+  } catch (e) {
+    _backendOnline = false;
+    atualizarIndicadorBackend(false);
+    console.log('[A&P] Backend offline — usando localStorage');
+  }
+}
 
-})();
+async function sincronizarChavesDoBackend() {
+  const mapaProvedor = {
+    'groq':      'ap-groq-key',
+    'openrouter':'ap-or-key',
+    'together':  'ap-tg-key',
+    'cerebras':  'ap-cb-key',
+    'sambanova': 'ap-sn-key',
+  };
+  const inputMap = {
+    'ap-groq-key': 'input-api-key',
+    'ap-or-key':   'input-or-key',
+    'ap-tg-key':   'input-tg-key',
+    'ap-cb-key':   'input-cb-key',
+    'ap-sn-key':   'input-sn-key',
+  };
+  const savedMap = {
+    'ap-groq-key': 'key-saved',
+    'ap-or-key':   'or-key-saved',
+    'ap-tg-key':   'tg-key-saved',
+    'ap-cb-key':   'cb-key-saved',
+    'ap-sn-key':   'sn-key-saved',
+  };
+
+  try {
+    for (const [provedor, storageKey] of Object.entries(mapaProvedor)) {
+      // Só busca do backend se ainda não tem localmente
+      if (!gk(storageKey)) {
+        const r = await fetch(AP_URL + '/api/chaves/' + provedor + '/valor');
+        if (r.ok) {
+          const d = await r.json();
+          if (d.chave) {
+            // Salva no localStorage e memória (sem reenviar ao backend)
+            try { localStorage.setItem(storageKey, d.chave); } catch(e) {}
+            if (!window._chavesMemoria) window._chavesMemoria = {};
+            window._chavesMemoria[storageKey] = d.chave;
+
+            // Atualiza o campo visual
+            const inputEl = document.getElementById(inputMap[storageKey]);
+            if (inputEl) inputEl.value = d.chave;
+            const savedEl = document.getElementById(savedMap[storageKey]);
+            if (savedEl) savedEl.style.display = 'inline';
+            console.log('[A&P] Chave ' + provedor + ' restaurada do backend ✓');
+          }
+        }
+      }
+    }
+  } catch(e) {}
+}
+
+// ── Indicador visual de backend na sidebar ────────────────────────────────────
+function atualizarIndicadorBackend(online) {
+  // Atualiza o status bar existente
+  const dot = document.getElementById('status-dot');
+  const txt = document.getElementById('status-txt');
+  if (online) {
+    // Injeta badge de backend após o status bar
+    if (!document.getElementById('backend-badge')) {
+      const statusBar = document.querySelector('.status-bar');
+      if (statusBar) {
+        const badge = document.createElement('div');
+        badge.id = 'backend-badge';
+        badge.style.cssText = 'margin-top:6px;font-size:10px;font-family:var(--mono);color:var(--success);display:flex;align-items:center;gap:5px;';
+        badge.innerHTML = '<span style="width:6px;height:6px;border-radius:50%;background:var(--success);display:inline-block;box-shadow:0 0 6px var(--success);"></span> Backend local conectado';
+        statusBar.parentNode.insertBefore(badge, statusBar.nextSibling);
+      }
+    }
+  } else {
+    if (!document.getElementById('backend-badge')) {
+      const statusBar = document.querySelector('.status-bar');
+      if (statusBar) {
+        const badge = document.createElement('div');
+        badge.id = 'backend-badge';
+        badge.style.cssText = 'margin-top:6px;font-size:10px;font-family:var(--mono);color:var(--muted);display:flex;align-items:center;gap:5px;';
+        badge.innerHTML = '<span style="width:6px;height:6px;border-radius:50%;background:var(--muted);display:inline-block;"></span> Backend offline <span style="color:var(--muted);font-size:9px;">(só localStorage)</span>';
+        statusBar.parentNode.insertBefore(badge, statusBar.nextSibling);
+      }
+    }
+  }
+}
+
+// ── Salvar parecer no backend ao confirmar ────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  // Inicia a verificação de backend
+  iniciarBackend();
+
+  // Intercepta o botão "Confirmar e Salvar" para também salvar no backend
+  const btnConfirmar = document.getElementById('btn-confirmar-parecer');
+  if (btnConfirmar) {
+    btnConfirmar.addEventListener('click', () => {
+      if (!_backendOnline) return;
+
+      // Pega o HTML do parecer
+      const editorEl = document.getElementById('editor-parecer');
+      if (!editorEl) return;
+
+      const cliente = (window.dadosExtraidos?._req || window.dadosExtraidos?.nomeCliente || 'cliente')
+        .replace(/[^a-zA-Z0-9\u00C0-\u024F]/g, '_').substring(0, 40);
+      const nomeArq = 'Parecer_' + cliente + '_' + Date.now() + '.html';
+
+      // Monta HTML completo do parecer
+      const htmlParecer = '<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Parecer</title>'
+        + '<style>body{font-family:"Times New Roman",serif;font-size:12pt;color:#111;max-width:740px;margin:40px auto;padding:0 48px;line-height:1.8;}table{border-collapse:collapse;width:100%;}</style>'
+        + '</head><body>' + editorEl.innerHTML + '</body></html>';
+
+      // Converte para base64
+      const b64 = btoa(unescape(encodeURIComponent(htmlParecer)));
+
+      const meta = {
+        cliente:   window.dadosExtraidos?._req || window.dadosExtraidos?.nomeCliente || '-',
+        beneficio: window.dadosExtraidos?._benef || '-',
+        tipo_doc:  window.dadosExtraidos?.tipoDocumento || '-',
+        resultado: window._parecerRes || '-',
+        advogado:  window._parecerAdv || '-',
+      };
+
+      fetch(AP_URL + '/api/pareceres', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nome_arquivo: nomeArq, conteudo_base64: b64, metadados: meta })
+      })
+      .then(r => r.json())
+      .then(d => {
+        if (d.sucesso) console.log('[A&P] Parecer salvo no backend — id=' + d.id);
+      })
+      .catch(() => {});
+
+      // Registra análise no histórico do backend
+      fetch(AP_URL + '/api/historico', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tipo_documento:   window.dadosExtraidos?.tipoDocumento || 'Desconhecido',
+          nome_arquivo:     nomeArq,
+          resultado:        window.dadosExtraidos || {},
+          provedor_ia:      'frontend',
+          duracao_segundos: 0
+        })
+      }).catch(() => {});
+    }, { capture: true }); // capture:true garante que roda antes dos outros listeners
+  }
+
+  // ── Botão para abrir pasta de pareceres no explorador ─────────────────────
+  const sidebar = document.querySelector('.sidebar-body');
+  if (sidebar && _backendOnline !== undefined) {
+    const btnPasta = document.createElement('button');
+    btnPasta.className = 'btn btn-outline btn-sm btn-full';
+    btnPasta.style.fontSize = '11px';
+    btnPasta.style.color = 'var(--muted2)';
+    btnPasta.textContent = '📂 Abrir pasta de pareceres';
+    btnPasta.addEventListener('click', () => {
+      fetch(AP_URL + '/api/abrir-pasta-pareceres')
+        .then(r => r.json())
+        .then(d => { if (d.sucesso) console.log('[A&P] Pasta aberta: ' + d.pasta); })
+        .catch(() => alert('Backend offline. Inicie o servidor primeiro.'));
+    });
+
+    // Insere antes do último .info-banner
+    const banner = sidebar.querySelector('.info-banner');
+    if (banner) sidebar.insertBefore(btnPasta, banner);
+  }
+});
 </script>
-
-<!-- ═══════════════════════════════════════════════════════════
-     A&P PEDÁGIOS & TRANSIÇÕES v1.0
-     
-     Seção dedicada para resolver o "bate-cabeça" com as regras
-     de transição da EC 103/2019.
-     
-     Calcula e COMPARA as 6 regras de transição + direito adquirido.
-     Mostra passo a passo do cálculo.
-     Aplica o fator previdenciário no Pedágio 50%.
-     Recomenda a melhor opção.
-     ═══════════════════════════════════════════════════════════ -->
-<style>
-/* Marco histórico (13/11/2019) */
-.ped-marco {
-  background: linear-gradient(135deg, rgba(201,168,76,.1) 0%, rgba(61,127,255,.05) 100%);
-  border: 1px solid rgba(201,168,76,.3);
-  border-radius: 12px;
-  padding: 18px 20px;
-  margin-bottom: 20px;
-  position: relative;
-}
-.ped-marco::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0; height: 2px;
-  background: linear-gradient(90deg, transparent, var(--gold), transparent);
-}
-.ped-marco-titulo {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  letter-spacing: .15em;
-  color: var(--gold);
-  text-transform: uppercase;
-  font-weight: 700;
-  margin-bottom: 10px;
-  display: flex; align-items: center; gap: 8px;
-}
-.ped-marco-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 14px;
-}
-.ped-marco-item { display: flex; flex-direction: column; gap: 3px; }
-.ped-marco-label {
-  font-size: 10px; color: var(--muted2);
-  font-family: var(--mono); letter-spacing: .1em; text-transform: uppercase;
-}
-.ped-marco-valor {
-  font-family: var(--serif); font-size: 18px;
-  color: var(--text); font-weight: 500;
-  letter-spacing: -.01em;
-}
-.ped-marco-valor.dourado { color: var(--gold); }
-
-/* Alerta de direito adquirido */
-.ped-direito-adquirido {
-  background: rgba(34,201,122,.08);
-  border: 1px solid rgba(34,201,122,.4);
-  border-left-width: 4px;
-  border-radius: 10px;
-  padding: 14px 18px;
-  margin-bottom: 16px;
-  display: flex; gap: 14px; align-items: flex-start;
-}
-.ped-direito-icon { font-size: 26px; }
-.ped-direito-titulo {
-  font-family: var(--serif); font-size: 17px;
-  color: var(--green); margin-bottom: 4px; font-weight: 600;
-}
-.ped-direito-desc {
-  font-size: 12.5px; color: var(--text); line-height: 1.6;
-}
-
-/* Cards de cada regra */
-.ped-regra {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  margin-bottom: 14px;
-  transition: border-color .25s var(--ease);
-}
-.ped-regra.melhor {
-  border-color: var(--gold);
-  box-shadow: 0 0 0 1px var(--gold), 0 4px 16px rgba(201,168,76,.15);
-}
-.ped-regra-header {
-  padding: 14px 18px;
-  background: linear-gradient(90deg, rgba(13,31,60,.7), transparent);
-  border-bottom: 1px solid var(--border);
-  display: flex; justify-content: space-between; align-items: center; gap: 14px;
-}
-.ped-regra-titulo {
-  font-family: var(--serif); font-size: 17px;
-  color: var(--text); font-weight: 500;
-  letter-spacing: -.01em;
-  display: flex; align-items: center; gap: 10px;
-}
-.ped-regra-base {
-  font-family: var(--mono); font-size: 10px;
-  color: var(--muted2); letter-spacing: .08em;
-  margin-top: 2px;
-}
-.ped-regra-rank {
-  background: var(--gold); color: #0a0d15;
-  font-family: var(--mono); font-size: 11px;
-  font-weight: 700; letter-spacing: .1em;
-  padding: 4px 10px; border-radius: 16px;
-  white-space: nowrap;
-}
-.ped-regra-body { padding: 16px 20px; }
-
-/* Quadro de cálculo */
-.ped-calc {
-  background: rgba(0,0,0,.2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px 16px;
-  margin: 12px 0;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.8;
-}
-.ped-calc-linha {
-  display: flex; justify-content: space-between;
-  padding: 2px 0;
-  border-bottom: 1px dashed rgba(255,255,255,.05);
-}
-.ped-calc-linha:last-child { border-bottom: none; }
-.ped-calc-linha.destaque {
-  padding: 8px 0;
-  margin-top: 6px;
-  border-top: 1px solid var(--gold);
-  border-bottom: none;
-  font-weight: 700;
-}
-.ped-calc-linha.destaque .ped-calc-valor {
-  color: var(--gold);
-  font-size: 14px;
-}
-.ped-calc-label { color: var(--muted2); }
-.ped-calc-valor { color: var(--text); font-weight: 600; }
-.ped-calc-valor.verde { color: var(--green); }
-.ped-calc-valor.vermelho { color: #e67070; }
-.ped-calc-op { color: var(--muted); margin: 0 6px; }
-
-/* Texto explicativo */
-.ped-explica {
-  font-size: 12.5px; color: var(--muted2);
-  line-height: 1.65; margin-top: 10px;
-}
-.ped-explica strong { color: var(--text); font-weight: 600; }
-
-/* Status da regra */
-.ped-status {
-  display: flex; flex-direction: column; gap: 6px;
-  margin-top: 12px; padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-.ped-status-linha { display: flex; justify-content: space-between; font-size: 12px; }
-.ped-status-linha .l { color: var(--muted2); }
-.ped-status-linha .v { color: var(--text); font-weight: 600; }
-
-.ped-data-direito {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 12px; border-radius: 14px;
-  font-family: var(--mono); font-size: 11px;
-  background: rgba(34,201,122,.12); color: var(--green);
-  border: 1px solid rgba(34,201,122,.3);
-  font-weight: 700;
-}
-.ped-data-direito.sem { background: rgba(224,82,82,.08); color: #e67070; border-color: rgba(224,82,82,.25); }
-
-/* Alerta de fator previdenciário */
-.ped-alerta-fator {
-  background: rgba(240,160,48,.08);
-  border-left: 3px solid var(--amber);
-  padding: 10px 14px;
-  border-radius: 0 6px 6px 0;
-  margin-top: 10px;
-  font-size: 11.5px;
-  color: var(--text);
-  line-height: 1.55;
-}
-.ped-alerta-fator strong { color: var(--amber); }
-
-/* Ranking resumo */
-.ped-ranking {
-  background: linear-gradient(135deg, rgba(34,201,122,.08) 0%, rgba(61,127,255,.04) 100%);
-  border: 1px solid rgba(34,201,122,.3);
-  border-left-width: 4px;
-  border-radius: 10px;
-  padding: 16px 20px;
-  margin-bottom: 18px;
-}
-.ped-ranking-titulo {
-  font-family: var(--serif);
-  font-size: 16px;
-  color: var(--green);
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.ped-ranking-desc {
-  font-size: 12.5px; color: var(--text);
-  line-height: 1.6;
-}
-
-/* Switcher: mostrar/ocultar cálculos */
-.ped-toggle-calc {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--muted2);
-  font-family: var(--mono); font-size: 10px;
-  letter-spacing: .1em;
-  padding: 5px 12px;
-  border-radius: 16px;
-  cursor: pointer;
-  transition: all .2s var(--ease);
-}
-.ped-toggle-calc:hover { color: var(--gold); border-color: var(--gold); }
-.ped-toggle-calc.ativo { background: rgba(201,168,76,.1); color: var(--gold); border-color: var(--gold); }
-</style>
-
-<script>
-'use strict';
-// ═══════════════════════════════════════════════════════════
-// A&P PEDÁGIOS & TRANSIÇÕES v1.0
-// ═══════════════════════════════════════════════════════════
-(function() {
-
-// ──────────────────────────────────────────────────────────
-// UTILS (reuso das já existentes se disponíveis)
-// ──────────────────────────────────────────────────────────
-function _fmtData(d) {
-  if (!d || !(d instanceof Date) || isNaN(d)) return '—';
-  return String(d.getDate()).padStart(2,'0') + '/' +
-         String(d.getMonth()+1).padStart(2,'0') + '/' +
-         d.getFullYear();
-}
-function _fmtTempo(meses) {
-  if (meses === null || meses === undefined) return '—';
-  var neg = meses < 0;
-  meses = Math.abs(meses);
-  var a = Math.floor(meses / 12);
-  var m = Math.round(meses % 12);
-  var s = a + 'a ' + m + 'm';
-  return neg ? '-' + s : s;
-}
-function _fmtDuracao(meses) {
-  if (!meses || meses < 0) return '—';
-  var a = Math.floor(meses / 12);
-  var m = Math.round(meses % 12);
-  return a + ' ano' + (a !== 1 ? 's' : '') + ' e ' + m + ' mes' + (m !== 1 ? 'es' : '');
-}
-function _parseComp(s) {
-  if (!s) return null;
-  var m = String(s).match(/(\d{1,2})\/(\d{4})/);
-  if (!m) return null;
-  return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 1);
-}
-function _parseDataBR(s) {
-  if (!s) return null;
-  var m = String(s).match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  if (!m) return null;
-  return new Date(parseInt(m[3]), parseInt(m[2])-1, parseInt(m[1]));
-}
-
-// ──────────────────────────────────────────────────────────
-// FATOR PREVIDENCIÁRIO (simplificado)
-// f = (Tc × a / Es) × [1 + (Id + Tc × a) / 100]
-// onde: a = 0.31, Tc = tempo contrib, Id = idade, Es = expectativa IBGE
-// ──────────────────────────────────────────────────────────
-// Tabela IBGE simplificada (expectativa em anos restantes por idade)
-var EXPECTATIVA_IBGE = {
-  50: 33.3, 51: 32.4, 52: 31.5, 53: 30.6, 54: 29.8,
-  55: 28.9, 56: 28.1, 57: 27.2, 58: 26.4, 59: 25.6,
-  60: 24.8, 61: 24.0, 62: 23.2, 63: 22.4, 64: 21.6,
-  65: 20.9, 66: 20.1, 67: 19.4, 68: 18.6, 69: 17.9,
-  70: 17.2,
-};
-
-function _fatorPrevidenciario(idadeAnos, tempoContribAnos) {
-  var idadeRound = Math.round(idadeAnos);
-  var es = EXPECTATIVA_IBGE[idadeRound] || (idadeRound < 50 ? 35 : 20);
-  var a = 0.31;
-  var f = (tempoContribAnos * a / es) * (1 + (idadeRound + tempoContribAnos * a) / 100);
-  return Math.round(f * 10000) / 10000; // 4 casas
-}
-
-// ──────────────────────────────────────────────────────────
-// CALCULADORAS — uma por regra
-// Todas retornam estrutura padronizada com passos, resultado, observações
-// ──────────────────────────────────────────────────────────
-function _calcDireitoAdquirido(ctx) {
-  // Tinha 30/35 anos contribuição em 13/11/2019?
-  var sexo = ctx.sexo;
-  var tempoMin = sexo === 'feminino' ? 360 : 420;
-  var t = ctx.tempoContrib2019 || 0;
-  var tinhaDireito = t >= tempoMin;
-  return {
-    nome: 'Direito Adquirido',
-    base: 'Art. 3º EC 103/2019',
-    aplicavel: tinhaDireito,
-    temDireito: tinhaDireito,
-    passos: [
-      { label: 'Tempo de contribuição em 13/11/2019', valor: _fmtDuracao(t), raw: t },
-      { label: 'Exigido pela regra antiga',            valor: _fmtDuracao(tempoMin), raw: tempoMin },
-      { label: 'Atingido antes da Reforma?',           valor: tinhaDireito ? '✓ SIM' : '✗ NÃO', destaque: true },
-    ],
-    observacao: tinhaDireito
-      ? 'Cliente já havia implementado os requisitos antes da Reforma. Tem direito INTEGRAL de se aposentar pela regra antiga — sem pedágio, sem idade mínima. Art. 3º EC 103 protege direito adquirido.'
-      : 'Ainda faltavam ' + _fmtDuracao(tempoMin - t) + ' em 13/11/2019 para ter direito adquirido pela regra antiga.',
-    dataDireito: tinhaDireito ? new Date(2019, 10, 13) : null,
-    fatorAplica: true,
-    fatorOpcional: true, // pode escolher não aplicar se resultado for pior
-  };
-}
-
-function _calcPedagio50(ctx) {
-  var sexo = ctx.sexo;
-  var tempoMinAntigo = sexo === 'feminino' ? 360 : 420;
-  var t2019 = ctx.tempoContrib2019 || 0;
-  var faltava2019 = Math.max(0, tempoMinAntigo - t2019);
-  var pedagio = Math.round(faltava2019 * 0.5);
-  var tempoExigido = t2019 + faltava2019 + pedagio; // = tempoMinAntigo + pedagio
-  // Idade mínima: 53F/55H (na data do atingimento)
-  var idadeMinAnos = sexo === 'feminino' ? 53 : 55;
-
-  // Precisa ter estado a ≤ 2 anos da regra antiga em 13/11/2019
-  var aplicavel = ctx.temContribAnterior2019 && faltava2019 <= 24 && faltava2019 > 0;
-
-  var tempoAtual = ctx.tempoContribMeses;
-  var idadeAtual = ctx.idadeAtualMeses / 12;
-  var faltaTempo = Math.max(0, tempoExigido - tempoAtual);
-  var faltaIdade = Math.max(0, idadeMinAnos - idadeAtual);
-  var temDireito = aplicavel && faltaTempo === 0 && faltaIdade <= 0;
-
-  // Data projetada (quando atinge ambos)
-  var dataDireito = null;
-  if (aplicavel && !temDireito) {
-    var hoje = new Date();
-    var d = new Date(hoje);
-    // Adiciona o maior entre: meses faltando de tempo ou de idade
-    var mesesFaltantes = Math.max(Math.ceil(faltaTempo), Math.ceil(faltaIdade * 12));
-    d.setMonth(d.getMonth() + mesesFaltantes);
-    dataDireito = d;
-  } else if (temDireito) {
-    dataDireito = new Date(); // já tem direito
-  }
-
-  // Fator previdenciário estimado
-  var fator = null;
-  if (aplicavel && (temDireito || dataDireito)) {
-    var idadeProjetada = Math.max(idadeAtual, idadeMinAnos);
-    var tempoProjetadoAnos = Math.max(tempoAtual, tempoExigido) / 12;
-    fator = _fatorPrevidenciario(idadeProjetada, tempoProjetadoAnos);
-  }
-
-  return {
-    nome: 'Pedágio 50%',
-    base: 'EC 103/2019 Art. 17',
-    aplicavel: aplicavel,
-    temDireito: temDireito,
-    passos: [
-      { label: 'Tempo em 13/11/2019',                valor: _fmtDuracao(t2019), raw: t2019 },
-      { label: 'Regra antiga (tempo mínimo)',        valor: _fmtDuracao(tempoMinAntigo), raw: tempoMinAntigo },
-      { label: 'Faltava em 13/11/2019',              valor: _fmtDuracao(faltava2019), raw: faltava2019 },
-      { label: '(×) Pedágio de 50% do que faltava',  valor: _fmtDuracao(pedagio), raw: pedagio, op: '×' },
-      { label: 'Tempo total exigido',                valor: _fmtDuracao(tempoExigido), raw: tempoExigido, destaque: true },
-      { label: 'Idade mínima',                       valor: idadeMinAnos + ' anos', raw: idadeMinAnos },
-      { label: 'Tempo atual',                        valor: _fmtDuracao(tempoAtual), raw: tempoAtual },
-      { label: 'Idade atual',                        valor: Math.floor(idadeAtual) + ' anos', raw: idadeAtual },
-      { label: 'Falta tempo',                        valor: faltaTempo === 0 ? '— nada' : _fmtDuracao(faltaTempo), raw: faltaTempo },
-      { label: 'Falta idade',                        valor: faltaIdade === 0 ? '— nada' : Math.ceil(faltaIdade * 12) + ' meses', raw: faltaIdade },
-    ],
-    observacao: !aplicavel
-      ? (faltava2019 === 0
-          ? 'Direito adquirido antes da Reforma — pedágio não é necessário.'
-          : 'Não se aplica: faltava mais de 2 anos em 13/11/2019 (faltavam ' + _fmtDuracao(faltava2019) + ').')
-      : 'Cliente está no grupo elegível (faltavam ≤ 2 anos em 13/11/2019).',
-    alertaFator: aplicavel,  // SEMPRE aplica fator
-    fator: fator,
-    dataDireito: dataDireito,
-    fatorAplica: true,
-  };
-}
-
-function _calcPedagio100(ctx) {
-  var sexo = ctx.sexo;
-  var tempoMinAntigo = sexo === 'feminino' ? 360 : 420;
-  var t2019 = ctx.tempoContrib2019 || 0;
-  var faltava2019 = Math.max(0, tempoMinAntigo - t2019);
-  var pedagio = faltava2019; // 100%
-  var tempoExigido = t2019 + faltava2019 + pedagio; // = tempoMinAntigo + pedagio
-  var idadeMinAnos = sexo === 'feminino' ? 57 : 60;
-
-  // Aplica-se a quem tem contribuição pré-Reforma (não tem limite de 2 anos como o 50%)
-  var aplicavel = ctx.temContribAnterior2019 && faltava2019 > 0;
-
-  var tempoAtual = ctx.tempoContribMeses;
-  var idadeAtual = ctx.idadeAtualMeses / 12;
-  var faltaTempo = Math.max(0, tempoExigido - tempoAtual);
-  var faltaIdade = Math.max(0, idadeMinAnos - idadeAtual);
-  var temDireito = aplicavel && faltaTempo === 0 && faltaIdade <= 0;
-
-  var dataDireito = null;
-  if (aplicavel && !temDireito) {
-    var hoje = new Date();
-    var d = new Date(hoje);
-    var mesesFaltantes = Math.max(Math.ceil(faltaTempo), Math.ceil(faltaIdade * 12));
-    d.setMonth(d.getMonth() + mesesFaltantes);
-    dataDireito = d;
-  } else if (temDireito) {
-    dataDireito = new Date();
-  }
-
-  return {
-    nome: 'Pedágio 100%',
-    base: 'EC 103/2019 Art. 20',
-    aplicavel: aplicavel,
-    temDireito: temDireito,
-    passos: [
-      { label: 'Tempo em 13/11/2019',                valor: _fmtDuracao(t2019), raw: t2019 },
-      { label: 'Regra antiga (tempo mínimo)',        valor: _fmtDuracao(tempoMinAntigo), raw: tempoMinAntigo },
-      { label: 'Faltava em 13/11/2019',              valor: _fmtDuracao(faltava2019), raw: faltava2019 },
-      { label: '(×) Pedágio de 100% do que faltava', valor: _fmtDuracao(pedagio), raw: pedagio, op: '×' },
-      { label: 'Tempo total exigido',                valor: _fmtDuracao(tempoExigido), raw: tempoExigido, destaque: true },
-      { label: 'Idade mínima',                       valor: idadeMinAnos + ' anos', raw: idadeMinAnos },
-      { label: 'Tempo atual',                        valor: _fmtDuracao(tempoAtual), raw: tempoAtual },
-      { label: 'Idade atual',                        valor: Math.floor(idadeAtual) + ' anos', raw: idadeAtual },
-      { label: 'Falta tempo',                        valor: faltaTempo === 0 ? '— nada' : _fmtDuracao(faltaTempo), raw: faltaTempo },
-      { label: 'Falta idade',                        valor: faltaIdade === 0 ? '— nada' : Math.ceil(faltaIdade * 12) + ' meses', raw: faltaIdade },
-    ],
-    observacao: !aplicavel
-      ? 'Não se aplica: sem contribuição pré-Reforma.'
-      : 'RMI INTEGRAL (100% da média dos salários). Não aplica fator previdenciário — é a regra mais vantajosa em termos de renda.',
-    alertaFator: false,
-    fatorAplica: false,
-    dataDireito: dataDireito,
-  };
-}
-
-function _calcPontos(ctx) {
-  var sexo = ctx.sexo;
-  var tempoMin = sexo === 'feminino' ? 360 : 420;
-  // Pontos em 2020: 87F/97H. Cresce 1 por ano até 100F/105H (mulher em 2033, homem em 2028)
-  var anoAtual = new Date().getFullYear();
-  var pontosBase = sexo === 'feminino' ? 87 : 97;
-  var pontosMax = sexo === 'feminino' ? 100 : 105;
-  var pontosExigidos = Math.min(pontosMax, pontosBase + (anoAtual - 2020));
-
-  var aplicavel = ctx.temContribAnterior2019;
-  var tempoAtual = ctx.tempoContribMeses;
-  var idadeAtual = ctx.idadeAtualMeses / 12;
-  var pontosAtuais = Math.floor(idadeAtual + tempoAtual/12);
-
-  var faltaTempo = Math.max(0, tempoMin - tempoAtual);
-  var faltamPontos = Math.max(0, pontosExigidos - pontosAtuais);
-  var temDireito = aplicavel && faltaTempo === 0 && faltamPontos === 0;
-
-  var dataDireito = null;
-  if (aplicavel && !temDireito) {
-    // cresce 1 ponto/ano (idade + tempo sobem juntos): faltam N pontos ÷ 2 anos (metade idade metade tempo)
-    var hoje = new Date();
-    var mesesFaltantes = Math.max(faltaTempo, Math.ceil(faltamPontos * 6));
-    var d = new Date(hoje);
-    d.setMonth(d.getMonth() + mesesFaltantes);
-    dataDireito = d;
-  } else if (temDireito) {
-    dataDireito = new Date();
-  }
-
-  return {
-    nome: 'Regra dos Pontos',
-    base: 'EC 103/2019 Art. 15',
-    aplicavel: aplicavel,
-    temDireito: temDireito,
-    passos: [
-      { label: 'Tempo mínimo de contribuição',         valor: _fmtDuracao(tempoMin), raw: tempoMin },
-      { label: 'Pontos exigidos em ' + anoAtual,       valor: pontosExigidos + ' pontos', raw: pontosExigidos, destaque: true },
-      { label: 'Tempo atual',                          valor: _fmtDuracao(tempoAtual), raw: tempoAtual },
-      { label: 'Idade atual',                          valor: Math.floor(idadeAtual) + ' anos', raw: idadeAtual },
-      { label: 'Pontos atuais (idade + tempo)',        valor: pontosAtuais + ' pontos', raw: pontosAtuais },
-      { label: 'Falta tempo',                          valor: faltaTempo === 0 ? '— nada' : _fmtDuracao(faltaTempo), raw: faltaTempo },
-      { label: 'Faltam pontos',                        valor: faltamPontos === 0 ? '— nada' : faltamPontos + ' pontos', raw: faltamPontos },
-    ],
-    observacao: !aplicavel
-      ? 'Não se aplica: sem contribuição pré-Reforma.'
-      : 'RMI calculada pela média + coeficiente (começa em 60%, +2% por ano adicional após 20H/15M). Sem fator.',
-    alertaFator: false,
-    fatorAplica: false,
-    dataDireito: dataDireito,
-  };
-}
-
-function _calcIdadeProgressiva(ctx) {
-  var sexo = ctx.sexo;
-  var tempoMin = sexo === 'feminino' ? 360 : 420;
-  // Idade inicial 2019: 56F/61H. Cresce 0,5/ano até 62F/65H
-  var anosDesde2019 = new Date().getFullYear() - 2019;
-  var idadeInicial = sexo === 'feminino' ? 56 : 61;
-  var idadeMaxima = sexo === 'feminino' ? 62 : 65;
-  var idadeExigida = Math.min(idadeMaxima, idadeInicial + anosDesde2019 * 0.5);
-
-  var aplicavel = ctx.temContribAnterior2019;
-  var tempoAtual = ctx.tempoContribMeses;
-  var idadeAtual = ctx.idadeAtualMeses / 12;
-
-  var faltaIdade = Math.max(0, idadeExigida - idadeAtual);
-  var faltaTempo = Math.max(0, tempoMin - tempoAtual);
-  var temDireito = aplicavel && faltaIdade <= 0 && faltaTempo === 0;
-
-  var dataDireito = null;
-  if (aplicavel && !temDireito) {
-    var hoje = new Date();
-    var d = new Date(hoje);
-    var mesesFaltantes = Math.max(Math.ceil(faltaIdade * 12), Math.ceil(faltaTempo));
-    d.setMonth(d.getMonth() + mesesFaltantes);
-    dataDireito = d;
-  } else if (temDireito) {
-    dataDireito = new Date();
-  }
-
-  return {
-    nome: 'Idade Progressiva',
-    base: 'EC 103/2019 Art. 16',
-    aplicavel: aplicavel,
-    temDireito: temDireito,
-    passos: [
-      { label: 'Idade inicial (2019)',                 valor: idadeInicial + ' anos', raw: idadeInicial },
-      { label: '(+) 0,5 ano por ano × ' + anosDesde2019 + ' anos', valor: '+' + (anosDesde2019 * 0.5), raw: anosDesde2019 * 0.5 },
-      { label: 'Idade exigida em ' + new Date().getFullYear(), valor: idadeExigida + ' anos', raw: idadeExigida, destaque: true },
-      { label: 'Tempo mínimo exigido',                 valor: _fmtDuracao(tempoMin), raw: tempoMin },
-      { label: 'Idade atual',                          valor: Math.floor(idadeAtual) + ' anos', raw: idadeAtual },
-      { label: 'Tempo atual',                          valor: _fmtDuracao(tempoAtual), raw: tempoAtual },
-      { label: 'Falta idade',                          valor: faltaIdade === 0 ? '— nada' : Math.ceil(faltaIdade * 12) + ' meses', raw: faltaIdade },
-      { label: 'Falta tempo',                          valor: faltaTempo === 0 ? '— nada' : _fmtDuracao(faltaTempo), raw: faltaTempo },
-    ],
-    observacao: !aplicavel
-      ? 'Não se aplica: sem contribuição pré-Reforma.'
-      : 'RMI pela média + 60% + 2% por ano adicional. Sem fator. Idade mínima sobe 0,5 ano/ano até 2031.',
-    alertaFator: false,
-    fatorAplica: false,
-    dataDireito: dataDireito,
-  };
-}
-
-function _calcRegraNova(ctx) {
-  // Regra permanente (pós-Reforma, todos): idade mínima + 180 meses
-  var sexo = ctx.sexo;
-  var idadeMin = sexo === 'feminino' ? 62 : 65;
-  var carenciaMin = 180;
-
-  var tempoAtual = ctx.tempoContribMeses;
-  var idadeAtual = ctx.idadeAtualMeses / 12;
-  var carencia = ctx.carencia || 0;
-
-  var faltaIdade = Math.max(0, idadeMin - idadeAtual);
-  var faltaCarencia = Math.max(0, carenciaMin - carencia);
-  var temDireito = faltaIdade <= 0 && faltaCarencia === 0;
-
-  var dataDireito = null;
-  if (!temDireito) {
-    var hoje = new Date();
-    var d = new Date(hoje);
-    var mesesFaltantes = Math.max(Math.ceil(faltaIdade * 12), faltaCarencia);
-    d.setMonth(d.getMonth() + mesesFaltantes);
-    dataDireito = d;
-  } else {
-    dataDireito = new Date();
-  }
-
-  return {
-    nome: 'Regra Nova (Idade Urbana)',
-    base: 'Art. 48 Lei 8.213/91 + EC 103/2019',
-    aplicavel: true, // todos
-    temDireito: temDireito,
-    passos: [
-      { label: 'Idade mínima',           valor: idadeMin + ' anos', raw: idadeMin },
-      { label: 'Carência mínima',        valor: carenciaMin + ' meses', raw: carenciaMin, destaque: true },
-      { label: 'Idade atual',            valor: Math.floor(idadeAtual) + ' anos', raw: idadeAtual },
-      { label: 'Carência atual',         valor: carencia + ' meses', raw: carencia },
-      { label: 'Falta idade',            valor: faltaIdade === 0 ? '— nada' : Math.ceil(faltaIdade * 12) + ' meses', raw: faltaIdade },
-      { label: 'Falta carência',         valor: faltaCarencia === 0 ? '— nada' : faltaCarencia + ' meses', raw: faltaCarencia },
-    ],
-    observacao: 'RMI = 60% da média + 2% por ano adicional após 20 anos (H) ou 15 anos (M). Sem fator previdenciário.',
-    alertaFator: false,
-    fatorAplica: false,
-    dataDireito: dataDireito,
-  };
-}
-
-// ──────────────────────────────────────────────────────────
-// RANKING INTELIGENTE — qual regra é melhor para este cliente?
-// ──────────────────────────────────────────────────────────
-function _rankearRegras(resultados, ctx) {
-  // Filtra só as aplicáveis
-  var aplic = resultados.filter(function(r) { return r.aplicavel; });
-  if (!aplic.length) return null;
-
-  // Ordena por:
-  // 1. Já tem direito > ainda não
-  // 2. Se ambos têm direito: o que tem RMI melhor (sem fator > com fator)
-  // 3. Se ambos não têm: o que tem data mais próxima
-  aplic.sort(function(a, b) {
-    // Direito adquirido sempre primeiro (se aplicável)
-    if (a.nome === 'Direito Adquirido' && a.temDireito) return -1;
-    if (b.nome === 'Direito Adquirido' && b.temDireito) return 1;
-
-    // Ambos com direito: sem fator ganha
-    if (a.temDireito && b.temDireito) {
-      if (a.fatorAplica !== b.fatorAplica) return a.fatorAplica ? 1 : -1;
-      return 0;
-    }
-    // Um com direito, outro sem: direito ganha
-    if (a.temDireito && !b.temDireito) return -1;
-    if (!a.temDireito && b.temDireito) return 1;
-    // Nenhum com direito: data mais próxima ganha
-    if (a.dataDireito && b.dataDireito) return a.dataDireito - b.dataDireito;
-    if (a.dataDireito) return -1;
-    if (b.dataDireito) return 1;
-    return 0;
-  });
-
-  var melhor = aplic[0];
-  var recomendacao = '';
-
-  if (melhor.nome === 'Direito Adquirido' && melhor.temDireito) {
-    recomendacao = 'Direito ADQUIRIDO antes da Reforma. Cliente pode se aposentar IMEDIATAMENTE pela regra antiga (Art. 3º EC 103/2019). Não precisa cumprir pedágio ou idade mínima.';
-  } else if (melhor.temDireito) {
-    if (melhor.fatorAplica) {
-      recomendacao = 'Melhor opção DISPONÍVEL HOJE: ' + melhor.nome + '. Mas ATENÇÃO: aplica fator previdenciário (~' + (melhor.fator ? melhor.fator.toFixed(2) : '?') + '), que reduz a RMI. Avalie se compensa aguardar regra sem fator.';
-    } else {
-      recomendacao = 'Melhor opção: ' + melhor.nome + '. Não aplica fator previdenciário — RMI integral.';
-    }
-  } else {
-    var quando = melhor.dataDireito ? _fmtData(melhor.dataDireito) : 'data futura';
-    recomendacao = 'Regra mais próxima: ' + melhor.nome + '. Direito estimado em ' + quando + '.';
-    if (melhor.fatorAplica) {
-      recomendacao += ' Observação: aplica fator previdenciário (RMI reduzida).';
-    }
-  }
-
-  // Se há Pedágio 50% e Pedágio 100% aplicáveis, compara
-  var p50 = resultados.find(function(r){ return r.nome === 'Pedágio 50%'; });
-  var p100 = resultados.find(function(r){ return r.nome === 'Pedágio 100%'; });
-  if (p50 && p100 && p50.aplicavel && p100.aplicavel) {
-    // Pedágio 100% geralmente é melhor em termos de RMI (sem fator)
-    if (p50.temDireito && !p100.temDireito && p100.dataDireito) {
-      var diff = p100.dataDireito - new Date();
-      var mesesEspera = Math.ceil(diff / (30.44 * 24 * 3600 * 1000));
-      if (mesesEspera <= 24) {
-        recomendacao += ' 💡 Comparação Pedágio: já tem direito pelo 50% (com fator), mas se esperar ' + mesesEspera + ' meses, Pedágio 100% paga valor integral (geralmente 25-35% a mais).';
-      }
-    }
-  }
-
-  return { melhor: melhor, recomendacao: recomendacao };
-}
-
-// ──────────────────────────────────────────────────────────
-// RENDERIZAÇÃO DO BLOCO
-// ──────────────────────────────────────────────────────────
-function _renderCalc(passos) {
-  var html = '<div class="ped-calc">';
-  passos.forEach(function(p) {
-    html += '<div class="ped-calc-linha' + (p.destaque ? ' destaque' : '') + '">'
-      + '  <span class="ped-calc-label">' + (p.op ? '<span class="ped-calc-op">' + p.op + '</span>' : '') + p.label + '</span>'
-      + '  <span class="ped-calc-valor">' + p.valor + '</span>'
-      + '</div>';
-  });
-  html += '</div>';
-  return html;
-}
-
-function _renderRegra(r, isMelhor) {
-  var badge;
-  if (!r.aplicavel)        badge = '<span class="ped-data-direito sem">Não aplicável</span>';
-  else if (r.temDireito)   badge = '<span class="ped-data-direito">✓ Tem direito HOJE</span>';
-  else if (r.dataDireito)  badge = '<span class="ped-data-direito">em ' + _fmtData(r.dataDireito) + '</span>';
-  else                     badge = '<span class="ped-data-direito sem">Sem projeção</span>';
-
-  var html = '<div class="ped-regra' + (isMelhor ? ' melhor' : '') + '">'
-    + '  <div class="ped-regra-header">'
-    + '    <div>'
-    + '      <div class="ped-regra-titulo">'
-    +          (isMelhor ? '🏆 ' : '') + r.nome
-    + '      </div>'
-    + '      <div class="ped-regra-base">' + r.base + '</div>'
-    + '    </div>'
-    + '    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">'
-    + '      ' + badge
-    + (isMelhor ? '<span class="ped-regra-rank">MELHOR OPÇÃO</span>' : '')
-    + '    </div>'
-    + '  </div>';
-
-  if (r.aplicavel) {
-    html += '  <div class="ped-regra-body">'
-      +      _renderCalc(r.passos)
-      + '    <div class="ped-explica">' + r.observacao + '</div>';
-
-    if (r.alertaFator) {
-      html += '<div class="ped-alerta-fator">'
-        + '<strong>⚠️ ATENÇÃO — FATOR PREVIDENCIÁRIO:</strong> esta regra aplica fator (~'
-        + (r.fator ? r.fator.toFixed(3) : 'calcular na data') + '). '
-        + 'Se &lt; 1,0, reduz a RMI proporcionalmente. '
-        + 'Exemplo: fator 0,72 em média de R$ 3.000 = RMI de R$ 2.160 (redução de 28%). '
-        + 'Considere esperar o Pedágio 100% (sem fator) se viável.'
-        + '</div>';
-    }
-
-    html += '  </div>';
-  } else {
-    html += '<div class="ped-regra-body"><div class="ped-explica">' + r.observacao + '</div></div>';
-  }
-
-  html += '</div>';
-  return html;
-}
-
-// ──────────────────────────────────────────────────────────
-// HOOK EM renderPlanejamento — adiciona seção
-// ──────────────────────────────────────────────────────────
-var _renderOrig = window.renderPlanejamento;
-
-window.renderPlanejamento = function() {
-  // Executa a cadeia anterior primeiro
-  if (typeof _renderOrig === 'function') _renderOrig();
-
-  var root = document.getElementById('tab-planejamento');
-  if (!root) return;
-  if (root.querySelector('.plan-empty')) return; // sem CNIS
-
-  // Monta contexto (mesma lógica dos outros módulos)
-  var dados = typeof dadosExtraidos !== 'undefined' ? dadosExtraidos : {};
-  var todos = typeof _todosDocumentosDados !== 'undefined' ? _todosDocumentosDados : [];
-  var cnis = (todos || []).find(function(d) {
-    return d && (d._tipoDetectado === 'cnis' || /cnis|extrato/i.test(d.tipoDocumento || ''));
-  }) || dados;
-
-  var sexo = (function() {
-    var n = (dados.nomeCliente || '').split(' ')[0];
-    return /a$/i.test(n) ? 'feminino' : 'masculino';
-  })();
-
-  var nasc = _parseDataBR(dados.dataNascimento || cnis.dataNascimento);
-  var hoje = new Date();
-  var idadeAtualMeses = nasc ? ((hoje.getFullYear()-nasc.getFullYear())*12 + (hoje.getMonth()-nasc.getMonth())) : 0;
-
-  var ctx = {
-    sexo: sexo,
-    idadeAtualMeses: idadeAtualMeses,
-    tempoContribMeses: cnis._totalContribuicoesValidas || cnis._totalContribuicoes || 0,
-    carencia: cnis._totalContribuicoesValidas || 0,
-    temContribAnterior2019: false,
-    tempoContrib2019: 0,
-    dataNascimento: nasc,
-  };
-
-  // Tempo pré-Reforma e idade em 13/11/2019
-  var reforma = new Date(2019, 10, 13);
-  if (cnis._contribuicoesDetalhadas) {
-    cnis._contribuicoesDetalhadas.forEach(function(c) {
-      var d = _parseComp(c.comp);
-      if (d && d < reforma) {
-        ctx.temContribAnterior2019 = true;
-        ctx.tempoContrib2019++;
-      }
-    });
-  }
-
-  var idadeEm2019Meses = nasc
-    ? ((reforma.getFullYear()-nasc.getFullYear())*12 + (reforma.getMonth()-nasc.getMonth()))
-    : null;
-
-  // Calcula todas as regras
-  var resultados = [
-    _calcDireitoAdquirido(ctx),
-    _calcPedagio100(ctx),
-    _calcPedagio50(ctx),
-    _calcPontos(ctx),
-    _calcIdadeProgressiva(ctx),
-    _calcRegraNova(ctx),
-  ];
-
-  var ranking = _rankearRegras(resultados, ctx);
-  var melhorNome = ranking ? ranking.melhor.nome : null;
-
-  // Direito adquirido — destaque especial
-  var direitoAdq = resultados.find(function(r){ return r.nome === 'Direito Adquirido' && r.temDireito; });
-
-  // HTML
-  var sexoLabel = sexo === 'feminino' ? 'Mulher' : 'Homem';
-  var tempoMinAnt = sexo === 'feminino' ? 360 : 420;
-  var faltavaEm2019 = Math.max(0, tempoMinAnt - (ctx.tempoContrib2019 || 0));
-
-  var html = ''
-    // Título da seção
-    + '<div class="plan-secao">'
-    + '  <div class="plan-th">⏳ Análise de Pedágios & Transições</div>'
-    + '  <div class="plan-secao-body">'
-
-    // Marco histórico
-    + '    <div class="ped-marco">'
-    + '      <div class="ped-marco-titulo">🧭 Situação em 13/11/2019 (Marco da Reforma)</div>'
-    + '      <div class="ped-marco-grid">'
-    + '        <div class="ped-marco-item">'
-    + '          <span class="ped-marco-label">Sexo</span>'
-    + '          <span class="ped-marco-valor">' + sexoLabel + '</span>'
-    + '        </div>'
-    + '        <div class="ped-marco-item">'
-    + '          <span class="ped-marco-label">Idade em 13/11/2019</span>'
-    + '          <span class="ped-marco-valor">' + (idadeEm2019Meses !== null ? Math.floor(idadeEm2019Meses/12) + ' anos' : '—') + '</span>'
-    + '        </div>'
-    + '        <div class="ped-marco-item">'
-    + '          <span class="ped-marco-label">Tempo de contribuição em 13/11/2019</span>'
-    + '          <span class="ped-marco-valor dourado">' + _fmtDuracao(ctx.tempoContrib2019) + '</span>'
-    + '        </div>'
-    + '        <div class="ped-marco-item">'
-    + '          <span class="ped-marco-label">Regra antiga exigia</span>'
-    + '          <span class="ped-marco-valor">' + _fmtDuracao(tempoMinAnt) + '</span>'
-    + '        </div>'
-    + '        <div class="ped-marco-item">'
-    + '          <span class="ped-marco-label">Faltava pela regra antiga</span>'
-    + '          <span class="ped-marco-valor ' + (faltavaEm2019 === 0 ? 'dourado' : '') + '">' + (faltavaEm2019 === 0 ? '0 (direito adquirido!)' : _fmtDuracao(faltavaEm2019)) + '</span>'
-    + '        </div>'
-    + '      </div>'
-    + '    </div>';
-
-  // Alerta de direito adquirido
-  if (direitoAdq) {
-    html += ''
-      + '    <div class="ped-direito-adquirido">'
-      + '      <div class="ped-direito-icon">🏛️</div>'
-      + '      <div>'
-      + '        <div class="ped-direito-titulo">Direito Adquirido — Pré-Reforma</div>'
-      + '        <div class="ped-direito-desc">'
-      + '          Cliente já havia cumprido <strong>' + _fmtDuracao(ctx.tempoContrib2019) + '</strong> em 13/11/2019 — acima do mínimo de ' + _fmtDuracao(tempoMinAnt) + ' da regra antiga. '
-      + '          <strong>Pode se aposentar pela regra antiga, sem pedágio, sem idade mínima.</strong> '
-      + '          Garantia do Art. 3º da EC 103/2019.'
-      + '        </div>'
-      + '      </div>'
-      + '    </div>';
-  }
-
-  // Recomendação
-  if (ranking && ranking.recomendacao) {
-    html += ''
-      + '    <div class="ped-ranking">'
-      + '      <div class="ped-ranking-titulo">🎯 Recomendação Inteligente</div>'
-      + '      <div class="ped-ranking-desc">' + ranking.recomendacao + '</div>'
-      + '    </div>';
-  }
-
-  // Cada regra (ordem: melhor primeiro)
-  var ordemExibicao = resultados.slice().sort(function(a, b) {
-    if (a.nome === melhorNome) return -1;
-    if (b.nome === melhorNome) return 1;
-    // aplicáveis antes
-    if (a.aplicavel !== b.aplicavel) return a.aplicavel ? -1 : 1;
-    return 0;
-  });
-
-  ordemExibicao.forEach(function(r) {
-    html += _renderRegra(r, r.nome === melhorNome);
-  });
-
-  html += '  </div></div>';
-
-  // Injeta ANTES da nota metodológica (último filho)
-  var ultimo = root.lastElementChild;
-  var container = document.createElement('div');
-  container.innerHTML = html;
-
-  // Procura a nota metodológica
-  var nota = null;
-  var filhos = root.children;
-  for (var i = filhos.length - 1; i >= 0; i--) {
-    if (filhos[i].textContent && filhos[i].textContent.includes('Nota:')) {
-      nota = filhos[i];
-      break;
-    }
-  }
-
-  // Move os filhos do container
-  if (nota) {
-    while (container.firstChild) {
-      root.insertBefore(container.firstChild, nota);
-    }
-  } else {
-    while (container.firstChild) {
-      root.appendChild(container.firstChild);
-    }
-  }
-};
-
-console.log('[A&P Pedágios] ✅ Análise de transições carregada');
-
-})();
-</script>
+<!-- ═══════════════════════════════════════════════════════ FIM INTEGRAÇÃO -->
 
 </body>
 </html>
